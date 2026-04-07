@@ -1,0 +1,22 @@
+[package]
+name = "machine-wallet"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+solana-program = { workspace = true }
+solana-system-interface = { version = "2.0", features = ["bincode"] }
+
+[dev-dependencies]
+solana-program-test = { version = "3.1", features = ["agave-unstable-api"] }
+solana-sdk = "3.0"
+solana-pubkey = "3.0"
+solana-sdk-ids = "3.0"
+solana-system-interface = { version = "2.0", features = ["bincode"] }
+tokio = { version = "1", features = ["full"] }
+p256 = { version = "0.13", features = ["ecdsa"] }
+rand_core = "0.6"
