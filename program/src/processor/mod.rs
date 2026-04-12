@@ -7,6 +7,7 @@ pub mod create_wallet;
 pub mod execute;
 pub(crate) mod init_pda_account;
 pub mod owner_close_session;
+pub mod provide_webauthn_evidence;
 pub mod remove_authority;
 pub mod revoke_session;
 pub mod self_revoke_session;
@@ -60,7 +61,8 @@ pub fn process_instruction(
             max_slot,
             session_authority,
             expiry_slot,
-            max_lamports_per_ix,
+            max_lamports_per_call,
+            max_total_spent_lamports,
             allowed_programs_count,
             allowed_programs,
         } => create_session::process(
@@ -70,7 +72,8 @@ pub fn process_instruction(
             max_slot,
             session_authority,
             expiry_slot,
-            max_lamports_per_ix,
+            max_lamports_per_call,
+            max_total_spent_lamports,
             allowed_programs_count,
             allowed_programs,
         ),
@@ -145,6 +148,15 @@ pub fn process_instruction(
             max_slot,
             session_authority,
             destination,
+        ),
+        MachineWalletInstruction::ProvideWebAuthnEvidence {
+            auth_data,
+            client_data_json,
+        } => provide_webauthn_evidence::process(
+            program_id,
+            accounts,
+            auth_data,
+            client_data_json,
         ),
     }
 }

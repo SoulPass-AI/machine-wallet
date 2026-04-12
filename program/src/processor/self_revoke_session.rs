@@ -82,7 +82,7 @@ mod tests {
     use crate::state::{SESSION_STATE_VERSION, MAX_ALLOWED_PROGRAMS};
     use solana_program::pubkey::Pubkey;
 
-    fn make_session_bytes(authority: &Pubkey, revoked: bool) -> [u8; SessionState::LEN] {
+    fn make_session_bytes(authority: &Pubkey, revoked: bool) -> Vec<u8> {
         let mut prog = [[0u8; 32]; MAX_ALLOWED_PROGRAMS];
         prog[0] = [0x11u8; 32];
 
@@ -95,12 +95,14 @@ mod tests {
             expiry_slot: 200,
             revoked,
             wallet_creation_slot: 50,
-            max_lamports_per_ix: 1_000_000,
+            max_lamports_per_call: 1_000_000,
             allowed_programs_count: 1,
             allowed_programs: prog,
+            max_total_spent_lamports: 0,
+            total_spent_lamports: 0,
         };
 
-        let mut buf = [0u8; SessionState::LEN];
+        let mut buf = vec![0u8; session.serialized_size()];
         session.serialize(&mut buf).unwrap();
         buf
     }

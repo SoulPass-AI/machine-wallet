@@ -31,7 +31,12 @@ pub(crate) fn init_pda_account<'a>(
         return Err(ProgramError::IncorrectProgramId);
     }
 
-    // Program-owned means the PDA was already initialized by us.
+    // Program-owned means the PDA was already initialized by us — this
+    // covers both live accounts AND tombstoned ones (closed wallets retain
+    // program ownership + rent-exempt lamports so the runtime never
+    // zero-lamport-GCs them, which is the mechanism that prevents
+    // close-then-recreate replay of pre-signed Executes; see
+    // `processor::close_wallet` for the full invariant).
     if *pda_account.owner == *owner {
         return Err(already_initialized_error.into());
     }

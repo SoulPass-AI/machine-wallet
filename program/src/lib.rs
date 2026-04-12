@@ -9,6 +9,7 @@ pub mod processor;
 pub mod secp256r1;
 pub mod state;
 pub mod threshold;
+pub mod webauthn;
 
 solana_program::entrypoint!(process_instruction);
 

@@ -2,10 +2,60 @@ use solana_program::program_error::ProgramError;
 
 use crate::error::MachineWalletError;
 use crate::state::MAX_ALLOWED_PROGRAMS;
+use crate::webauthn::{MAX_AUTH_DATA_SIZE, MAX_CLIENT_DATA_JSON_SIZE, MIN_AUTH_DATA_SIZE};
 
 /// Maximum number of inner instructions in a single Execute call.
 /// Prevents OOM from malicious count values and keeps compute budget reasonable.
 pub const MAX_INNER_INSTRUCTIONS: usize = 64;
+
+/// Parse the payload of a ProvideWebAuthnEvidence instruction (i.e. the bytes
+/// *after* the discriminator).
+///
+/// Wire format:
+///   auth_data_len        : u16 LE
+///   auth_data            : auth_data_len bytes
+///   client_data_json_len : u16 LE
+///   client_data_json     : client_data_json_len bytes
+///
+/// Structural invariants enforced here — the downstream semantic validator
+/// (`webauthn::build_webauthn_message`) never has to reject inputs for being
+/// the wrong size or empty; it only rejects for cryptographic / policy reasons
+/// (wrong rpIdHash, UP/UV cleared, challenge mismatch, etc.). Keeping these
+/// layers separate is first-principles defense-in-depth.
+pub(crate) fn parse_webauthn_evidence_payload(
+    data: &[u8],
+) -> Result<(&[u8], &[u8]), ProgramError> {
+    if data.len() < 4 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let auth_data_len = u16::from_le_bytes([data[0], data[1]]) as usize;
+    if auth_data_len < MIN_AUTH_DATA_SIZE || auth_data_len > MAX_AUTH_DATA_SIZE {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let cd_len_off = 2usize
+        .checked_add(auth_data_len)
+        .ok_or(ProgramError::InvalidInstructionData)?;
+    let cd_len_end = cd_len_off
+        .checked_add(2)
+        .ok_or(ProgramError::InvalidInstructionData)?;
+    if cd_len_end > data.len() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let auth_data = &data[2..cd_len_off];
+    let client_data_json_len =
+        u16::from_le_bytes([data[cd_len_off], data[cd_len_off + 1]]) as usize;
+    if client_data_json_len == 0 || client_data_json_len > MAX_CLIENT_DATA_JSON_SIZE {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let cd_start = cd_len_end;
+    let cd_end = cd_start
+        .checked_add(client_data_json_len)
+        .ok_or(ProgramError::InvalidInstructionData)?;
+    if cd_end != data.len() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    Ok((auth_data, &data[cd_start..cd_end]))
+}
 
 /// A single account entry for CPI: index into remaining_accounts + permission flags.
 /// The authority signs these flags, preventing relay manipulation of is_writable.
@@ -73,12 +123,28 @@ impl InnerInstructionRef<'_> {
 
 /// Instruction variants for the MachineWallet program.
 ///
+/// The wallet uses the **Evidence Sidecar** model for multi-scheme signing.
+/// Wallet instructions (Execute, management ops) carry only the operation's
+/// parameters; signature evidence lives in **independent sidecar instructions**
+/// within the same transaction:
+///
+/// - **SECP256R1 / ED25519**: the scheme's precompile instruction (signing the
+///   32-byte operation hash) is its own evidence — standard Solana flow.
+/// - **WEBAUTHN**: one secp256r1 precompile (signing `auth_data ‖ SHA256(cd)`)
+///   *plus* one `ProvideWebAuthnEvidence` instruction carrying `auth_data` and
+///   `clientDataJSON` so the on-chain scanner can reconstruct the signed bytes.
+///
+/// This symmetry means an M-of-N wallet can combine arbitrarily many signers
+/// of arbitrary schemes in one transaction — each signer contributes an
+/// independent set of ixs, and the threshold scanner in `threshold.rs` counts
+/// all valid contributions.
+///
 /// Wire format:
 /// - CreateWallet:    [0] + authority (33 bytes) OR [0] + sig_scheme (u8) + authority (33 bytes)
 /// - Execute:         [1] + secp256r1_ix_index (u8) + max_slot (u64 LE) + inner_instruction_count (u32 LE) + inner instructions
 /// - CloseWallet:     [2] + secp256r1_ix_index (u8) + max_slot (u64 LE) + destination (32 bytes)
 /// - AdvanceNonce:    [3] + secp256r1_ix_index (u8) + max_slot (u64 LE)
-/// - CreateSession:   [4] + secp256r1_ix_index (u8) + max_slot (u64 LE) + session_authority (32) + expiry_slot (u64 LE) + max_lamports_per_ix (u64 LE) + allowed_programs_count (u8) + allowed_programs (count*32)
+/// - CreateSession:   [4] + secp256r1_ix_index (u8) + max_slot (u64 LE) + session_authority (32) + expiry_slot (u64 LE) + max_lamports_per_call (u64 LE) + max_total_spent_lamports (u64 LE) + allowed_programs_count (u8) + allowed_programs (count*32)
 /// - SessionExecute:  [5] + inner_instruction_count (u32 LE) + inner instructions
 /// - RevokeSession:   [6] + secp256r1_ix_index (u8) + max_slot (u64 LE) + session_authority (32)
 /// - SelfRevokeSession: [7]
@@ -87,6 +153,12 @@ impl InnerInstructionRef<'_> {
 /// - RemoveAuthority: [10] + precompile_ix_index (u8) + remove_sig_scheme (u8) + remove_pubkey (33) + new_threshold (u8) + max_slot (u64 LE)
 /// - SetThreshold:    [11] + precompile_ix_index (u8) + new_threshold (u8) + max_slot (u64 LE)
 /// - OwnerCloseSession: [12] + precompile_ix_index (u8) + max_slot (u64 LE) + session_authority (32) + destination (32)
+/// - ProvideWebAuthnEvidence: [14] + auth_data_len (u16 LE) + auth_data + client_data_json_len (u16 LE) + client_data_json
+///   Sidecar instruction — no state change. Its presence in the tx makes the
+///   carried auth_data / clientDataJSON available to every wallet instruction
+///   in the same tx for WEBAUTHN-scheme threshold contribution.
+///
+/// Discriminator 13 is reserved.
 ///
 /// Inner instruction wire format:
 ///   program_id (32) + accounts_len (u16 LE) + data_len (u16 LE) + accounts (accounts_len * 2 bytes: index + flags) + data
@@ -124,7 +196,12 @@ pub enum MachineWalletInstruction<'a> {
         max_slot: u64,
         session_authority: [u8; 32],
         expiry_slot: u64,
-        max_lamports_per_ix: u64,
+        /// Net vault outflow cap per SessionExecute call (0 = unlimited).
+        max_lamports_per_call: u64,
+        /// Lifetime cumulative outflow cap across all SessionExecute calls under
+        /// this session (0 = unlimited). When > 0, bounds the blast radius of a
+        /// compromised session key independent of how many transactions it submits.
+        max_total_spent_lamports: u64,
         allowed_programs_count: u8,
         allowed_programs: [[u8; 32]; MAX_ALLOWED_PROGRAMS],
     },
@@ -179,6 +256,19 @@ pub enum MachineWalletInstruction<'a> {
         max_slot: u64,
         session_authority: [u8; 32],
         destination: [u8; 32],
+    },
+
+    /// Sidecar instruction carrying a WebAuthn passkey assertion (authenticatorData
+    /// + clientDataJSON) so that the tx-wide threshold scanner can reconstruct
+    /// the signed message for a paired secp256r1 precompile.
+    ///
+    /// This instruction does NOT mutate any state. Its only purpose is to live in
+    /// the tx's instruction list so that `threshold::verify_threshold_signatures`
+    /// can see it via the instructions sysvar. One sidecar contributes at most
+    /// one WEBAUTHN-scheme authority toward a wallet instruction's threshold.
+    ProvideWebAuthnEvidence {
+        auth_data: &'a [u8],
+        client_data_json: &'a [u8],
     },
 }
 
@@ -334,8 +424,11 @@ impl<'a> MachineWalletInstruction<'a> {
 
             // CreateSession
             4 => {
-                // Minimum: secp256r1_ix_index(1) + max_slot(8) + session_authority(32) + expiry_slot(8) + max_lamports_per_ix(8) + allowed_programs_count(1) = 58
-                if rest.len() < 1 + 8 + 32 + 8 + 8 + 1 {
+                // Minimum: secp256r1_ix_index(1) + max_slot(8) + session_authority(32)
+                //        + expiry_slot(8) + max_lamports_per_call(8)
+                //        + max_total_spent_lamports(8) + allowed_programs_count(1) = 66
+                const BASE_LEN: usize = 1 + 8 + 32 + 8 + 8 + 8 + 1;
+                if rest.len() < BASE_LEN {
                     return Err(ProgramError::InvalidInstructionData);
                 }
                 let secp256r1_ix_index = rest[0];
@@ -343,21 +436,29 @@ impl<'a> MachineWalletInstruction<'a> {
                 let mut session_authority = [0u8; 32];
                 session_authority.copy_from_slice(&rest[9..41]);
                 let expiry_slot = u64::from_le_bytes(rest[41..49].try_into().unwrap());
-                let max_lamports_per_ix = u64::from_le_bytes(rest[49..57].try_into().unwrap());
-                let allowed_programs_count = rest[57];
+                let max_lamports_per_call = u64::from_le_bytes(rest[49..57].try_into().unwrap());
+                let max_total_spent_lamports =
+                    u64::from_le_bytes(rest[57..65].try_into().unwrap());
+                let allowed_programs_count = rest[65];
 
+                // Reject zero (state deserialization also rejects it; keep both
+                // layers in sync so a malformed session cannot be created and
+                // then bricked on first SessionExecute).
+                if allowed_programs_count == 0 {
+                    return Err(MachineWalletError::TooManyAllowedPrograms.into());
+                }
                 if allowed_programs_count as usize > MAX_ALLOWED_PROGRAMS {
                     return Err(MachineWalletError::TooManyAllowedPrograms.into());
                 }
 
                 let count = allowed_programs_count as usize;
-                if rest.len() != 58 + count * 32 {
+                if rest.len() != BASE_LEN + count * 32 {
                     return Err(ProgramError::InvalidInstructionData);
                 }
 
                 let mut allowed_programs = [[0u8; 32]; MAX_ALLOWED_PROGRAMS];
                 for (i, prog) in allowed_programs.iter_mut().take(count).enumerate() {
-                    let start = 58 + i * 32;
+                    let start = BASE_LEN + i * 32;
                     prog.copy_from_slice(&rest[start..start + 32]);
                 }
 
@@ -366,7 +467,8 @@ impl<'a> MachineWalletInstruction<'a> {
                     max_slot,
                     session_authority,
                     expiry_slot,
-                    max_lamports_per_ix,
+                    max_lamports_per_call,
+                    max_total_spent_lamports,
                     allowed_programs_count,
                     allowed_programs,
                 })
@@ -485,10 +587,25 @@ impl<'a> MachineWalletInstruction<'a> {
                 })
             }
 
+            // ProvideWebAuthnEvidence (sidecar). No state change; delegates
+            // structural validation to `parse_webauthn_evidence_payload`.
+            14 => {
+                let (auth_data, client_data_json) = parse_webauthn_evidence_payload(rest)?;
+                Ok(Self::ProvideWebAuthnEvidence {
+                    auth_data,
+                    client_data_json,
+                })
+            }
+
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
 }
+
+/// Discriminator for `ProvideWebAuthnEvidence`. Exposed so the threshold
+/// scanner can recognize sidecar instructions without depending on the
+/// full enum.
+pub const PROVIDE_WEBAUTHN_EVIDENCE_DISCRIMINATOR: u8 = 14;
 
 #[cfg(test)]
 mod tests {
@@ -841,7 +958,8 @@ mod tests {
         let session_authority = [0xAAu8; 32];
         data.extend_from_slice(&session_authority); // session_authority
         data.extend_from_slice(&99999u64.to_le_bytes()); // expiry_slot
-        data.extend_from_slice(&5_000_000u64.to_le_bytes()); // max_lamports_per_ix
+        data.extend_from_slice(&5_000_000u64.to_le_bytes()); // max_lamports_per_call
+        data.extend_from_slice(&100_000_000u64.to_le_bytes()); // max_total_spent_lamports
         data.push(2); // allowed_programs_count
         let prog0 = [0x11u8; 32];
         let prog1 = [0x22u8; 32];
@@ -855,7 +973,8 @@ mod tests {
                 max_slot,
                 session_authority: sa,
                 expiry_slot,
-                max_lamports_per_ix,
+                max_lamports_per_call,
+                max_total_spent_lamports,
                 allowed_programs_count,
                 allowed_programs,
             } => {
@@ -863,7 +982,8 @@ mod tests {
                 assert_eq!(max_slot, 12345);
                 assert_eq!(sa, session_authority);
                 assert_eq!(expiry_slot, 99999);
-                assert_eq!(max_lamports_per_ix, 5_000_000);
+                assert_eq!(max_lamports_per_call, 5_000_000);
+                assert_eq!(max_total_spent_lamports, 100_000_000);
                 assert_eq!(allowed_programs_count, 2);
                 assert_eq!(allowed_programs[0], prog0);
                 assert_eq!(allowed_programs[1], prog1);
@@ -874,28 +994,21 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_create_session_zero_programs_accepted_at_parse() {
+    fn test_parse_create_session_zero_programs_rejected() {
         let mut data = vec![4u8]; // discriminator
         data.push(0); // secp256r1_ix_index
         data.extend_from_slice(&0u64.to_le_bytes()); // max_slot
         data.extend_from_slice(&[0u8; 32]); // session_authority
         data.extend_from_slice(&0u64.to_le_bytes()); // expiry_slot
-        data.extend_from_slice(&0u64.to_le_bytes()); // max_lamports_per_ix
-        data.push(0); // allowed_programs_count = 0
+        data.extend_from_slice(&0u64.to_le_bytes()); // max_lamports_per_call
+        data.extend_from_slice(&0u64.to_le_bytes()); // max_total_spent_lamports
+        data.push(0); // allowed_programs_count = 0 — must be rejected (creates a brick session)
 
-        // Parser should accept count=0; processor may reject later
-        let ix = MachineWalletInstruction::unpack(&data).unwrap();
-        match ix {
-            MachineWalletInstruction::CreateSession {
-                allowed_programs_count,
-                allowed_programs,
-                ..
-            } => {
-                assert_eq!(allowed_programs_count, 0);
-                assert_eq!(allowed_programs, [[0u8; 32]; MAX_ALLOWED_PROGRAMS]);
-            }
-            _ => panic!("Expected CreateSession"),
-        }
+        let result = MachineWalletInstruction::unpack(&data);
+        assert_eq!(
+            result.unwrap_err(),
+            ProgramError::Custom(crate::error::MachineWalletError::TooManyAllowedPrograms as u32)
+        );
     }
 
     #[test]
@@ -905,7 +1018,8 @@ mod tests {
         data.extend_from_slice(&0u64.to_le_bytes()); // max_slot
         data.extend_from_slice(&[0u8; 32]); // session_authority
         data.extend_from_slice(&0u64.to_le_bytes()); // expiry_slot
-        data.extend_from_slice(&0u64.to_le_bytes()); // max_lamports_per_ix
+        data.extend_from_slice(&0u64.to_le_bytes()); // max_lamports_per_call
+        data.extend_from_slice(&0u64.to_le_bytes()); // max_total_spent_lamports
         data.push(9); // allowed_programs_count = 9 (> MAX_ALLOWED_PROGRAMS = 8)
                       // Add 9 * 32 bytes of program data
         data.extend_from_slice(&[0u8; 9 * 32]);
@@ -1239,5 +1353,137 @@ mod tests {
             }
             _ => panic!("Expected CreateWallet"),
         }
+    }
+
+    // ─── ProvideWebAuthnEvidence sidecar parsing ─────────────────────────────
+
+    fn build_sidecar_data(auth_data: &[u8], client_data_json: &[u8]) -> Vec<u8> {
+        let mut data = vec![14u8]; // discriminator
+        data.extend_from_slice(&(auth_data.len() as u16).to_le_bytes());
+        data.extend_from_slice(auth_data);
+        data.extend_from_slice(&(client_data_json.len() as u16).to_le_bytes());
+        data.extend_from_slice(client_data_json);
+        data
+    }
+
+    #[test]
+    fn test_parse_provide_webauthn_evidence_valid() {
+        let auth_data = [0xAAu8; MIN_AUTH_DATA_SIZE];
+        let cd = br#"{"type":"webauthn.get","challenge":"abc"}"#;
+        let data = build_sidecar_data(&auth_data, cd);
+        let ix = MachineWalletInstruction::unpack(&data).unwrap();
+        match ix {
+            MachineWalletInstruction::ProvideWebAuthnEvidence {
+                auth_data: ad,
+                client_data_json: cdj,
+            } => {
+                assert_eq!(ad, &auth_data[..]);
+                assert_eq!(cdj, &cd[..]);
+            }
+            _ => panic!("Expected ProvideWebAuthnEvidence"),
+        }
+    }
+
+    #[test]
+    fn test_parse_sidecar_empty_payload() {
+        let data = vec![14u8]; // discriminator only — no length bytes
+        let err = MachineWalletInstruction::unpack(&data).unwrap_err();
+        assert_eq!(err, ProgramError::InvalidInstructionData);
+    }
+
+    #[test]
+    fn test_parse_sidecar_auth_data_below_min() {
+        for short_len in [0usize, 1, 10, MIN_AUTH_DATA_SIZE - 1] {
+            let mut data = vec![14u8];
+            data.extend_from_slice(&(short_len as u16).to_le_bytes());
+            data.extend_from_slice(&vec![0u8; short_len]);
+            data.extend_from_slice(&3u16.to_le_bytes());
+            data.extend_from_slice(b"abc");
+            let err = MachineWalletInstruction::unpack(&data).unwrap_err();
+            assert_eq!(
+                err,
+                ProgramError::InvalidInstructionData,
+                "auth_data_len={} must be rejected",
+                short_len
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_sidecar_auth_data_above_max() {
+        let mut data = vec![14u8];
+        data.extend_from_slice(&((MAX_AUTH_DATA_SIZE as u16 + 1).to_le_bytes()));
+        data.extend_from_slice(&vec![0u8; MAX_AUTH_DATA_SIZE + 1]);
+        data.extend_from_slice(&3u16.to_le_bytes());
+        data.extend_from_slice(b"abc");
+        let err = MachineWalletInstruction::unpack(&data).unwrap_err();
+        assert_eq!(err, ProgramError::InvalidInstructionData);
+    }
+
+    #[test]
+    fn test_parse_sidecar_cd_empty_rejected() {
+        let auth_data = [0u8; MIN_AUTH_DATA_SIZE];
+        let mut data = vec![14u8];
+        data.extend_from_slice(&(MIN_AUTH_DATA_SIZE as u16).to_le_bytes());
+        data.extend_from_slice(&auth_data);
+        data.extend_from_slice(&0u16.to_le_bytes()); // cd_len = 0
+        let err = MachineWalletInstruction::unpack(&data).unwrap_err();
+        assert_eq!(err, ProgramError::InvalidInstructionData);
+    }
+
+    #[test]
+    fn test_parse_sidecar_cd_above_max() {
+        let auth_data = [0u8; MIN_AUTH_DATA_SIZE];
+        let mut data = vec![14u8];
+        data.extend_from_slice(&(MIN_AUTH_DATA_SIZE as u16).to_le_bytes());
+        data.extend_from_slice(&auth_data);
+        data.extend_from_slice(&((MAX_CLIENT_DATA_JSON_SIZE as u16 + 1).to_le_bytes()));
+        data.extend_from_slice(&vec![0u8; MAX_CLIENT_DATA_JSON_SIZE + 1]);
+        let err = MachineWalletInstruction::unpack(&data).unwrap_err();
+        assert_eq!(err, ProgramError::InvalidInstructionData);
+    }
+
+    #[test]
+    fn test_parse_sidecar_rejects_trailing_bytes() {
+        let auth_data = [0u8; MIN_AUTH_DATA_SIZE];
+        let cd = b"{}";
+        let mut data = build_sidecar_data(&auth_data, cd);
+        data.push(0xFF); // trailing garbage
+        let err = MachineWalletInstruction::unpack(&data).unwrap_err();
+        assert_eq!(err, ProgramError::InvalidInstructionData);
+    }
+
+    #[test]
+    fn test_parse_sidecar_auth_at_min_boundary() {
+        let auth_data = [0u8; MIN_AUTH_DATA_SIZE];
+        let cd = b"{}";
+        let data = build_sidecar_data(&auth_data, cd);
+        let ix = MachineWalletInstruction::unpack(&data).unwrap();
+        matches!(ix, MachineWalletInstruction::ProvideWebAuthnEvidence { .. });
+    }
+
+    #[test]
+    fn test_parse_sidecar_auth_at_max_boundary() {
+        let auth_data = vec![0u8; MAX_AUTH_DATA_SIZE];
+        let cd = b"{}";
+        let data = build_sidecar_data(&auth_data, cd);
+        let ix = MachineWalletInstruction::unpack(&data).unwrap();
+        matches!(ix, MachineWalletInstruction::ProvideWebAuthnEvidence { .. });
+    }
+
+    /// The previously exposed `PROVIDE_WEBAUTHN_EVIDENCE_DISCRIMINATOR` must
+    /// match the wire discriminator we accept.
+    #[test]
+    fn test_sidecar_discriminator_constant() {
+        assert_eq!(PROVIDE_WEBAUTHN_EVIDENCE_DISCRIMINATOR, 14);
+    }
+
+    /// Discriminator 13 (previously `ExecuteWebAuthn`) must now be rejected —
+    /// clients relying on it must migrate to `Execute` + sidecar.
+    #[test]
+    fn test_disc_13_is_reserved_and_rejected() {
+        let data = vec![13u8];
+        let err = MachineWalletInstruction::unpack(&data).unwrap_err();
+        assert_eq!(err, ProgramError::InvalidInstructionData);
     }
 }

@@ -138,16 +138,36 @@ pub fn process(
         return Err(MachineWalletError::InvalidSessionPDA.into());
     }
 
-    // 14. Verify wallet PDA (create_program_address ~1500 CU)
-    let id = wallet.id();
-    let expected_wallet_pda = Pubkey::create_program_address(
-        &[MachineWallet::SEED_PREFIX, &id, &[wallet.bump]],
-        program_id,
-    )
-    .map_err(|_| MachineWalletError::InvalidWalletPDA)?;
-    if *wallet_account.key != expected_wallet_pda {
-        return Err(MachineWalletError::InvalidWalletPDA.into());
-    }
+    // 14. Wallet PDA is NOT re-derived here — it is provably already verified:
+    //
+    //     Invariant (write-time verification, read-time trust):
+    //       (a) session_account.owner == program_id (step 4) → this session
+    //           was created by OUR CreateSession processor;
+    //       (b) create_session.rs:168-175 PDA-validates `wallet_account` via
+    //           `create_program_address(SEED_PREFIX, wallet.id(), wallet.bump)`
+    //           BEFORE writing `session.wallet = wallet_account.key`;
+    //       (c) step 6 above checks `session.wallet == wallet_account.key`,
+    //           transitively asserting the stored wallet key matches the one
+    //           PDA-verified at session creation;
+    //       (d) wallet_account.owner == program_id (step 4) rules out a
+    //           non-wallet account being substituted at this address;
+    //       (e) close_wallet.rs tombstones the PDA (data[0]=CLOSED_MARKER,
+    //           owner preserved, rent-exempt) — `deserialize_runtime` (step 5
+    //           via step 11) fails `InvalidAccountData` on version byte 0xFF,
+    //           so a tombstoned wallet cannot slip past;
+    //       (f) step 12 enforces session.wallet_creation_slot == wallet.creation_slot,
+    //           which rejects any successor wallet at the same address (impossible
+    //           by (e) but checked as defense-in-depth).
+    //
+    //     Therefore re-deriving the wallet PDA here would only re-prove (b),
+    //     which is already transitively established via (a)+(c)+(d). Saves
+    //     ~1500 CU per SessionExecute — a hot-path instruction.
+    //
+    //     FUTURE REGRESSION RISK: if CreateSession is ever refactored to no
+    //     longer PDA-validate `wallet_account` before writing `session.wallet`,
+    //     this optimization MUST be reverted. The test
+    //     `test_session_execute_assumes_create_session_pda_validation` in this
+    //     module's tests asserts the load-bearing branch exists.
 
     // 15. Verify vault PDA (create_program_address ~1500 CU)
     let expected_vault_pda = Pubkey::create_program_address(
@@ -168,12 +188,23 @@ pub fn process(
         return Err(MachineWalletError::InvalidVaultOwner.into());
     }
 
-    // 17. Record vault lamports BEFORE CPI if max_lamports_per_ix > 0.
-    //     This cap is per SessionExecute invocation — a single transaction may
-    //     contain multiple SessionExecute instructions, each independently capped.
-    //     When max_lamports_per_ix == 0, no cap is enforced (the wallet owner
-    //     explicitly authorized an uncapped session).
-    let vault_lamports_before = if session.max_lamports_per_ix > 0 {
+    // 17. Record vault lamports BEFORE CPI when any outflow cap is enforced.
+    //     Two independent caps exist:
+    //       • max_lamports_per_call — bounds net outflow of THIS single SessionExecute
+    //         invocation. Multiple SessionExecute ixs in the same tx each pay this
+    //         cap independently.
+    //       • max_total_spent_lamports — bounds the CUMULATIVE lifetime outflow
+    //         across every SessionExecute ever run under this session. This is the
+    //         only cap that bounds total blast radius of a compromised session key.
+    //     Either cap == 0 disables that specific cap (owner explicitly opted out).
+    //     When max_total_spent_lamports > 0, the session account must be writable
+    //     so we can persist the updated total_spent_lamports counter after CPI.
+    let enforce_per_call = session.max_lamports_per_call > 0;
+    let enforce_total = session.max_total_spent_lamports > 0;
+    if enforce_total && !session_account.is_writable {
+        return Err(MachineWalletError::AccountNotWritable.into());
+    }
+    let vault_lamports_before = if enforce_per_call || enforce_total {
         vault_account.lamports()
     } else {
         0
@@ -200,16 +231,65 @@ pub fn process(
     //     outflow is 0 — we do NOT allow inflows to offset a larger subsequent withdrawal.
     //     This prevents a "deposit-then-overdraw" attack where an attacker deposits X SOL
     //     into the vault mid-CPI, then withdraws X + cap, making the net look within cap.
-    //     The cap bounds the maximum SOL the vault can LOSE in a single SessionExecute.
-    if session.max_lamports_per_ix > 0 {
+    if enforce_per_call || enforce_total {
         let vault_lamports_after = vault_account.lamports();
-        if vault_lamports_after < vault_lamports_before {
-            let outflow = vault_lamports_before - vault_lamports_after;
-            if outflow > session.max_lamports_per_ix {
-                return Err(MachineWalletError::IxAmountExceeded.into());
+        let outflow = vault_lamports_before.saturating_sub(vault_lamports_after);
+        if enforce_per_call && outflow > session.max_lamports_per_call {
+            return Err(MachineWalletError::IxAmountExceeded.into());
+        }
+        if enforce_total {
+            let new_total = session
+                .total_spent_lamports
+                .checked_add(outflow)
+                .ok_or(ProgramError::ArithmeticOverflow)?;
+            if new_total > session.max_total_spent_lamports {
+                return Err(MachineWalletError::SessionSpendCapExceeded.into());
             }
+            // Persist the updated cumulative counter. Because this comes AFTER a
+            // successful CPI loop but BEFORE returning Ok, a failure here rolls
+            // back the whole tx including any transfers made by the CPI, so we
+            // can never charge the vault without recording the spend.
+            let mut data = session_account.try_borrow_mut_data()?;
+            SessionState::write_total_spent(&mut data, session.allowed_programs_count, new_total)?;
         }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    /// REGRESSION GUARD for the optimization at step 14 of `process()`.
+    ///
+    /// The wallet PDA re-derivation in `SessionExecute` was removed because
+    /// `create_session` already PDA-validates `wallet_account` before writing
+    /// `session.wallet`. If CreateSession is ever changed to skip that check,
+    /// this test points to the exact invariant that must be re-examined
+    /// before merging — the comment at step 14 references this test by name.
+    ///
+    /// The test is deliberately source-level: asserting presence of the
+    /// `create_program_address` call that underpins the load-bearing
+    /// invariant, so it fails fast if someone unknowingly deletes it.
+    #[test]
+    fn test_session_execute_assumes_create_session_pda_validation() {
+        let src =
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/processor/create_session.rs"));
+        // Exact tokens from the create_session wallet-PDA verification block.
+        assert!(
+            src.contains("Pubkey::create_program_address"),
+            "create_session.rs must call create_program_address to PDA-validate wallet"
+        );
+        assert!(
+            src.contains("MachineWallet::SEED_PREFIX"),
+            "create_session.rs must derive the wallet PDA using MachineWallet::SEED_PREFIX"
+        );
+        assert!(
+            src.contains("wallet.bump"),
+            "create_session.rs must use wallet.bump when re-deriving"
+        );
+        assert!(
+            src.contains("InvalidWalletPDA"),
+            "create_session.rs must reject mismatched wallet PDA"
+        );
+    }
 }

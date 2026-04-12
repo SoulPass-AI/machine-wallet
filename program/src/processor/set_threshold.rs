@@ -105,9 +105,10 @@ pub fn process(
         new_threshold,
     );
 
-    // 8. Signature verification (v0: single precompile at index, v1: threshold scan)
+    // 8. Signature verification.
     threshold::verify_wallet_signatures(
         instructions_sysvar,
+        program_id,
         &wallet,
         precompile_ix_index,
         &expected_message,

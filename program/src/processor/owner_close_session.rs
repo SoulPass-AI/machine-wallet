@@ -114,12 +114,27 @@ pub fn process(
     let session = SessionState::deserialize_runtime(&session_data)?;
     drop(session_data);
 
-    // Validate session PDA before trusting any session content.
+    // Verify stored content MATCHES the instruction argument BEFORE deriving
+    // the PDA. If these drifted (a future edit removing the equality check),
+    // the PDA seeds would be `session_authority` while the account content
+    // used a different authority — seed substitution attack surface. Ordering
+    // this authority check first closes that window permanently.
+    if session.authority != session_authority {
+        return Err(MachineWalletError::SessionAuthorityMismatch.into());
+    }
+    if session.wallet != wallet_account.key.to_bytes()
+        || session.wallet_creation_slot != wallet.creation_slot
+    {
+        return Err(MachineWalletError::SessionWalletMismatch.into());
+    }
+
+    // Now we can trust `session.authority` == `session_authority`; derive the
+    // PDA from verified state.
     let expected_session_pda = Pubkey::create_program_address(
         &[
             SESSION_SEED_PREFIX,
             wallet_account.key.as_ref(),
-            &session_authority,
+            &session.authority,
             &[session.bump],
         ],
         program_id,
@@ -127,15 +142,6 @@ pub fn process(
     .map_err(|_| MachineWalletError::InvalidSessionPDA)?;
     if *session_account.key != expected_session_pda {
         return Err(MachineWalletError::InvalidSessionPDA.into());
-    }
-
-    if session.wallet != wallet_account.key.to_bytes()
-        || session.wallet_creation_slot != wallet.creation_slot
-    {
-        return Err(MachineWalletError::SessionWalletMismatch.into());
-    }
-    if session.authority != session_authority {
-        return Err(MachineWalletError::SessionAuthorityMismatch.into());
     }
 
     // Only revoked or expired sessions can be closed by the owner.
@@ -153,6 +159,7 @@ pub fn process(
     );
     threshold::verify_wallet_signatures(
         instructions_sysvar,
+        program_id,
         &wallet,
         precompile_ix_index,
         &expected_message,

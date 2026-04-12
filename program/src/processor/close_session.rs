@@ -129,7 +129,7 @@ mod tests {
         revoked: bool,
         created_slot: u64,
         expiry_slot: u64,
-    ) -> [u8; SessionState::LEN] {
+    ) -> Vec<u8> {
         let mut prog = [[0u8; 32]; MAX_ALLOWED_PROGRAMS];
         prog[0] = [0x11u8; 32];
 
@@ -142,12 +142,14 @@ mod tests {
             expiry_slot,
             revoked,
             wallet_creation_slot: 50,
-            max_lamports_per_ix: 1_000_000,
+            max_lamports_per_call: 1_000_000,
             allowed_programs_count: 1,
             allowed_programs: prog,
+            max_total_spent_lamports: 0,
+            total_spent_lamports: 0,
         };
 
-        let mut buf = [0u8; SessionState::LEN];
+        let mut buf = vec![0u8; session.serialized_size()];
         session.serialize(&mut buf).unwrap();
         buf
     }
@@ -208,11 +210,15 @@ mod tests {
 
     #[test]
     fn test_zeroed_session_data_prevents_deserialization_as_active() {
-        // After closing, data is all zeros. Deserialization must now hard-fail.
-        let zeroed = [0u8; SessionState::LEN];
-        assert_eq!(
-            SessionState::deserialize(&zeroed).unwrap_err(),
-            ProgramError::InvalidAccountData
-        );
+        // After closing, data is all zeros. Deserialization must hard-fail.
+        // Cover both the minimum and maximum serialized sizes so a tombstoned
+        // account of any legal size refuses to parse as active.
+        for size in [SessionState::MIN_SIZE, SessionState::MAX_SIZE] {
+            let zeroed = vec![0u8; size];
+            assert_eq!(
+                SessionState::deserialize(&zeroed).unwrap_err(),
+                ProgramError::InvalidAccountData
+            );
+        }
     }
 }

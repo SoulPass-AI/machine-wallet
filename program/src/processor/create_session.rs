@@ -22,33 +22,40 @@ use crate::{
 /// Domain separator for CreateSession messages, prevents cross-protocol collision.
 const CREATE_SESSION_TAG: &[u8] = b"machine_wallet_create_session_v0";
 
-/// Hash session data: keccak256(session_authority || expiry_slot_le || max_lamports_per_ix_le || count_byte || programs...)
+/// Hash session data: keccak256(session_authority || expiry_slot_le || max_lamports_per_call_le || max_total_spent_lamports_le || count_byte || programs...)
 /// Zero copy — passes each program as a separate slice to hashv, avoiding the
 /// 256-byte flat buffer + memcpy. hashv feeds slices sequentially into the hasher,
 /// producing identical output to hashing the concatenation.
+///
+/// SECURITY: Every wallet-owner-visible session parameter MUST appear in this
+/// hash. A field missing here would allow a MITM relayer to swap it between
+/// what the owner signed and what the program stores.
 pub fn hash_session_data(
     session_authority: &[u8; 32],
     expiry_slot: u64,
-    max_lamports_per_ix: u64,
+    max_lamports_per_call: u64,
+    max_total_spent_lamports: u64,
     allowed_programs_count: u8,
     allowed_programs: &[[u8; 32]],
 ) -> [u8; 32] {
     let expiry_slot_bytes = expiry_slot.to_le_bytes();
-    let max_lamports_bytes = max_lamports_per_ix.to_le_bytes();
+    let max_lamports_bytes = max_lamports_per_call.to_le_bytes();
+    let max_total_bytes = max_total_spent_lamports.to_le_bytes();
     let count_byte = [allowed_programs_count];
 
-    // 4 fixed slices + up to MAX_ALLOWED_PROGRAMS program slices, no flat buffer copy
-    let mut slices: [&[u8]; 4 + MAX_ALLOWED_PROGRAMS] = [&[]; 4 + MAX_ALLOWED_PROGRAMS];
+    // 5 fixed slices + up to MAX_ALLOWED_PROGRAMS program slices, no flat buffer copy
+    let mut slices: [&[u8]; 5 + MAX_ALLOWED_PROGRAMS] = [&[]; 5 + MAX_ALLOWED_PROGRAMS];
     slices[0] = session_authority;
     slices[1] = &expiry_slot_bytes;
     slices[2] = &max_lamports_bytes;
-    slices[3] = &count_byte;
+    slices[3] = &max_total_bytes;
+    slices[4] = &count_byte;
     let count = allowed_programs.len();
     for (i, prog) in allowed_programs.iter().enumerate() {
-        slices[4 + i] = prog;
+        slices[5 + i] = prog;
     }
 
-    keccak::hashv(&slices[..4 + count]).to_bytes()
+    keccak::hashv(&slices[..5 + count]).to_bytes()
 }
 
 /// Compute create-session message: keccak256(CREATE_SESSION_TAG || wallet_pda || creation_slot_le || nonce_le || max_slot_le || session_data_hash)
@@ -82,7 +89,8 @@ pub fn process(
     max_slot: u64,
     session_authority: [u8; 32],
     expiry_slot: u64,
-    max_lamports_per_ix: u64,
+    max_lamports_per_call: u64,
+    max_total_spent_lamports: u64,
     allowed_programs_count: u8,
     allowed_programs: [[u8; 32]; MAX_ALLOWED_PROGRAMS],
 ) -> ProgramResult {
@@ -138,8 +146,15 @@ pub fn process(
         return Err(MachineWalletError::SignatureExpired.into());
     }
 
-    // 5. Session expiry must be in the future
+    // 5. Session expiry must be in the future AND bounded to prevent a
+    //    misconfigured UI from creating effectively immortal sessions.
+    //    30 days at 400ms/slot ≈ 6_480_000 slots.
+    const MAX_SESSION_LIFETIME_SLOTS: u64 = 6_480_000;
     if expiry_slot <= clock.slot {
+        return Err(MachineWalletError::InvalidSessionData.into());
+    }
+    let lifetime = expiry_slot - clock.slot;
+    if lifetime > MAX_SESSION_LIFETIME_SLOTS {
         return Err(MachineWalletError::InvalidSessionData.into());
     }
 
@@ -163,7 +178,8 @@ pub fn process(
     let session_data_hash = hash_session_data(
         &session_authority,
         expiry_slot,
-        max_lamports_per_ix,
+        max_lamports_per_call,
+        max_total_spent_lamports,
         allowed_programs_count,
         &allowed_programs[..allowed_programs_count as usize],
     );
@@ -175,9 +191,10 @@ pub fn process(
         &session_data_hash,
     );
 
-    // 9. Signature verification (v0: single precompile, v1: threshold scan)
+    // 9. Signature verification.
     threshold::verify_wallet_signatures(
         instructions_sysvar,
+        program_id,
         &wallet,
         secp256r1_ix_index,
         &expected_message,
@@ -227,7 +244,7 @@ pub fn process(
         session_account,
         system_program,
         program_id,
-        SessionState::LEN,
+        SessionState::size(allowed_programs_count),
         session_signer_seeds,
         MachineWalletError::SessionAlreadyExists,
     )?;
@@ -242,9 +259,11 @@ pub fn process(
         expiry_slot,
         revoked: false,
         wallet_creation_slot: wallet.creation_slot,
-        max_lamports_per_ix,
+        max_lamports_per_call,
         allowed_programs_count,
         allowed_programs,
+        max_total_spent_lamports,
+        total_spent_lamports: 0,
     };
 
     // 14. Serialize SessionState into session account data
@@ -262,8 +281,8 @@ mod tests {
     fn test_hash_session_data_deterministic() {
         let authority = [0xAAu8; 32];
         let prog = [0x11u8; 32];
-        let hash1 = hash_session_data(&authority, 1000, 5_000_000, 1, &[prog]);
-        let hash2 = hash_session_data(&authority, 1000, 5_000_000, 1, &[prog]);
+        let hash1 = hash_session_data(&authority, 1000, 5_000_000, 0, 1, &[prog]);
+        let hash2 = hash_session_data(&authority, 1000, 5_000_000, 0, 1, &[prog]);
         assert_eq!(hash1, hash2);
     }
 
@@ -272,8 +291,8 @@ mod tests {
         let auth1 = [0xAAu8; 32];
         let auth2 = [0xBBu8; 32];
         let prog = [0x11u8; 32];
-        let hash1 = hash_session_data(&auth1, 1000, 5_000_000, 1, &[prog]);
-        let hash2 = hash_session_data(&auth2, 1000, 5_000_000, 1, &[prog]);
+        let hash1 = hash_session_data(&auth1, 1000, 5_000_000, 0, 1, &[prog]);
+        let hash2 = hash_session_data(&auth2, 1000, 5_000_000, 0, 1, &[prog]);
         assert_ne!(hash1, hash2);
     }
 
@@ -281,8 +300,8 @@ mod tests {
     fn test_hash_session_data_different_expiry() {
         let authority = [0xAAu8; 32];
         let prog = [0x11u8; 32];
-        let hash1 = hash_session_data(&authority, 1000, 5_000_000, 1, &[prog]);
-        let hash2 = hash_session_data(&authority, 2000, 5_000_000, 1, &[prog]);
+        let hash1 = hash_session_data(&authority, 1000, 5_000_000, 0, 1, &[prog]);
+        let hash2 = hash_session_data(&authority, 2000, 5_000_000, 0, 1, &[prog]);
         assert_ne!(hash1, hash2);
     }
 
@@ -290,8 +309,19 @@ mod tests {
     fn test_hash_session_data_different_max_lamports() {
         let authority = [0xAAu8; 32];
         let prog = [0x11u8; 32];
-        let hash1 = hash_session_data(&authority, 1000, 5_000_000, 1, &[prog]);
-        let hash2 = hash_session_data(&authority, 1000, 10_000_000, 1, &[prog]);
+        let hash1 = hash_session_data(&authority, 1000, 5_000_000, 0, 1, &[prog]);
+        let hash2 = hash_session_data(&authority, 1000, 10_000_000, 0, 1, &[prog]);
+        assert_ne!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_hash_session_data_different_max_total_spent() {
+        let authority = [0xAAu8; 32];
+        let prog = [0x11u8; 32];
+        // max_total_spent_lamports must be part of the signed hash — otherwise
+        // a relayer could swap the lifetime cap between owner-signed and stored.
+        let hash1 = hash_session_data(&authority, 1000, 5_000_000, 100_000_000, 1, &[prog]);
+        let hash2 = hash_session_data(&authority, 1000, 5_000_000, 200_000_000, 1, &[prog]);
         assert_ne!(hash1, hash2);
     }
 
@@ -300,8 +330,8 @@ mod tests {
         let authority = [0xAAu8; 32];
         let prog1 = [0x11u8; 32];
         let prog2 = [0x22u8; 32];
-        let hash1 = hash_session_data(&authority, 1000, 5_000_000, 1, &[prog1]);
-        let hash2 = hash_session_data(&authority, 1000, 5_000_000, 1, &[prog2]);
+        let hash1 = hash_session_data(&authority, 1000, 5_000_000, 0, 1, &[prog1]);
+        let hash2 = hash_session_data(&authority, 1000, 5_000_000, 0, 1, &[prog2]);
         assert_ne!(hash1, hash2);
     }
 
@@ -310,8 +340,8 @@ mod tests {
         let authority = [0xAAu8; 32];
         let prog = [0x11u8; 32];
         // Same single program, but different count byte changes the hash
-        let hash1 = hash_session_data(&authority, 1000, 5_000_000, 1, &[prog]);
-        let hash2 = hash_session_data(&authority, 1000, 5_000_000, 2, &[prog]);
+        let hash1 = hash_session_data(&authority, 1000, 5_000_000, 0, 1, &[prog]);
+        let hash2 = hash_session_data(&authority, 1000, 5_000_000, 0, 2, &[prog]);
         assert_ne!(hash1, hash2);
     }
 

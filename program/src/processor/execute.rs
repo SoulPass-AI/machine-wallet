@@ -68,7 +68,7 @@ type ValidatedInstructions = (Vec<(usize, Pubkey)>, [u8; 32]);
 
 /// Validate all inner instruction accounts AND compute the inner instructions hash
 /// in a single pass. Saves one full iteration + eliminates the separate hash function.
-fn validate_and_hash_inner_instructions(
+pub(crate) fn validate_and_hash_inner_instructions(
     inner_instructions: &[InnerInstructionRef<'_>],
     remaining_accounts: &[AccountInfo],
     program_id: &Pubkey,
@@ -133,19 +133,28 @@ pub(crate) fn execute_cpi_loop(
     vault_account: &AccountInfo,
     vault_signer_seeds: &[&[u8]],
 ) -> ProgramResult {
-    let mut account_infos = Vec::new();
-    let mut account_metas = Vec::new();
-    let mut cpi_data = Vec::new();
+    // Pre-size to the worst-case inner instruction so the first iteration
+    // doesn't trigger a heap reallocation. `+1` on account_infos accounts
+    // for the program account pushed at the end of each iteration.
+    let max_accounts = inner_instructions
+        .iter()
+        .map(|ix| ix.account_count())
+        .max()
+        .unwrap_or(0);
+    let max_data = inner_instructions
+        .iter()
+        .map(|ix| ix.data.len())
+        .max()
+        .unwrap_or(0);
+    let mut account_infos = Vec::with_capacity(max_accounts + 1);
+    let mut account_metas = Vec::with_capacity(max_accounts);
+    let mut cpi_data = Vec::with_capacity(max_data);
     for (inner_ix, (program_account_index, target_program_id)) in
         inner_instructions.iter().zip(program_entries.into_iter())
     {
         account_infos.clear();
         account_metas.clear();
         cpi_data.clear();
-        let needed = inner_ix.account_count().saturating_add(1);
-        account_infos.reserve(needed);
-        account_metas.reserve(inner_ix.account_count());
-        cpi_data.reserve(inner_ix.data.len());
         cpi_data.extend_from_slice(inner_ix.data);
 
         for entry in inner_ix.accounts() {
@@ -206,21 +215,21 @@ pub fn compute_message_hash(
     .to_bytes()
 }
 
-pub fn process(
+/// Execute preamble. Validates accounts, enforces anti-reentry, verifies PDAs,
+/// loads wallet state, and computes the inner-ix hash. Threshold signature
+/// verification happens next in `process`, and — via the Evidence Sidecar
+/// model in `threshold::verify_threshold_signatures` — covers every wallet
+/// authority scheme (SECP256R1, ED25519, WEBAUTHN, and future PQ) uniformly.
+fn prepare_execute_context(
     program_id: &Pubkey,
-    accounts: &[AccountInfo],
-    secp256r1_ix_index: u8,
+    instructions_sysvar: &AccountInfo,
+    wallet_account: &AccountInfo,
+    fee_payer: &AccountInfo,
+    vault_account: &AccountInfo,
+    remaining_accounts: &[AccountInfo],
     max_slot: u64,
-    inner_instructions: Vec<InnerInstructionRef<'_>>,
-) -> ProgramResult {
-    let account_iter = &mut accounts.iter();
-
-    let instructions_sysvar = next_account_info(account_iter)?;
-    let wallet_account = next_account_info(account_iter)?;
-    let fee_payer = next_account_info(account_iter)?;
-    let vault_account = next_account_info(account_iter)?;
-    let remaining_accounts = &accounts[4..];
-
+    inner_instructions: &[InnerInstructionRef<'_>],
+) -> Result<(MachineWallet, Vec<(usize, Pubkey)>, [u8; 32]), ProgramError> {
     // 1. Reject empty execute (no-op would waste a nonce)
     if inner_instructions.is_empty() {
         return Err(ProgramError::InvalidInstructionData);
@@ -244,9 +253,8 @@ pub fn process(
 
     // 4. Anti-reentry: stack_height == TRANSACTION_LEVEL_STACK_HEIGHT guarantees we are
     //    a top-level instruction, not reached via any CPI chain (direct or indirect).
-    //    This is strictly stronger than the previous get_instruction_relative(0) check,
-    //    which only compared program_id and could pass in indirect callback scenarios
-    //    (A → X → Y → A) where the top-level instruction was also our program.
+    //    This is strictly stronger than get_instruction_relative(0), which only compared
+    //    program_id and could pass in indirect callback scenarios (A → X → Y → A).
     if get_stack_height() > TRANSACTION_LEVEL_STACK_HEIGHT {
         return Err(MachineWalletError::CpiReentryDenied.into());
     }
@@ -254,7 +262,7 @@ pub fn process(
     // 5. Pre-validate all CPI account references AND compute inner instruction hash
     //    in a single pass — saves one full iteration over inner instructions.
     let (program_entries, inner_hash) =
-        validate_and_hash_inner_instructions(&inner_instructions, remaining_accounts, program_id)?;
+        validate_and_hash_inner_instructions(inner_instructions, remaining_accounts, program_id)?;
 
     // 6. Signature expiry: current slot must not exceed max_slot
     let clock = Clock::get()?;
@@ -298,7 +306,36 @@ pub fn process(
         return Err(MachineWalletError::InvalidVaultOwner.into());
     }
 
-    // 11. Compute expected message hash (inner_hash already computed in step 5)
+    Ok((wallet, program_entries, inner_hash))
+}
+
+pub fn process(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    secp256r1_ix_index: u8,
+    max_slot: u64,
+    inner_instructions: Vec<InnerInstructionRef<'_>>,
+) -> ProgramResult {
+    let account_iter = &mut accounts.iter();
+
+    let instructions_sysvar = next_account_info(account_iter)?;
+    let wallet_account = next_account_info(account_iter)?;
+    let fee_payer = next_account_info(account_iter)?;
+    let vault_account = next_account_info(account_iter)?;
+    let remaining_accounts = &accounts[4..];
+
+    let (wallet, program_entries, inner_hash) = prepare_execute_context(
+        program_id,
+        instructions_sysvar,
+        wallet_account,
+        fee_payer,
+        vault_account,
+        remaining_accounts,
+        max_slot,
+        &inner_instructions,
+    )?;
+
+    // Compute expected 32-byte execute message hash.
     let expected_message = compute_message_hash(
         wallet_account.key,
         wallet.creation_slot,
@@ -307,23 +344,23 @@ pub fn process(
         &inner_hash,
     );
 
-    // 12. Signature verification (v0: single precompile, v1: threshold scan)
     threshold::verify_wallet_signatures(
         instructions_sysvar,
+        program_id,
         &wallet,
         secp256r1_ix_index,
         &expected_message,
     )?;
 
-    // 15. Increment nonce BEFORE CPI (checks-effects-interactions pattern).
+    // Increment nonce BEFORE CPI (checks-effects-interactions pattern).
     //
     // SECURITY: The nonce must be incremented before executing any CPI as defense-in-depth.
-    // The primary anti-reentry guard is get_stack_height() (step 4), which hard-rejects
-    // all CPI invocations regardless of call chain depth. The CEI nonce pattern is a
-    // secondary safeguard: even if the stack-height check were somehow bypassed, a
-    // reentrant Execute would compute a different message hash (nonce+1 vs signed nonce),
-    // causing MessageMismatch. If any CPI fails, the entire transaction rolls back
-    // atomically (nonce included).
+    // The primary anti-reentry guard is get_stack_height() in prepare_execute_context,
+    // which hard-rejects all CPI invocations regardless of call chain depth. The CEI
+    // nonce pattern is a secondary safeguard: even if the stack-height check were
+    // somehow bypassed, a reentrant Execute would compute a different message hash
+    // (nonce+1 vs signed nonce), causing MessageMismatch. If any CPI fails, the entire
+    // transaction rolls back atomically (nonce included).
     let new_nonce = wallet
         .nonce
         .checked_add(1)
@@ -334,15 +371,15 @@ pub fn process(
         data[nonce_off..nonce_off + 8].copy_from_slice(&new_nonce.to_le_bytes());
     }
 
-    // 16. Execute CPI for each inner instruction
+    // Execute CPI for each inner instruction.
+    // SECURITY: inner_hash is computed over the resolved Pubkeys, not raw indices.
+    // Reordering or substituting `remaining_accounts` now changes the signed message.
     let vault_signer_seeds: &[&[u8]] = &[
         MachineWallet::VAULT_SEED_PREFIX,
         wallet_account.key.as_ref(),
         &[wallet.vault_bump],
     ];
 
-    // SECURITY: inner_hash is computed over the resolved Pubkeys, not raw indices.
-    // Reordering or substituting `remaining_accounts` now changes the signed message.
     execute_cpi_loop(
         &inner_instructions,
         program_entries,

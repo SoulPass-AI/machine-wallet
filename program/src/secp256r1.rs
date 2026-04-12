@@ -65,40 +65,26 @@ pub struct PrecompileVerifyResult {
     pub message: [u8; MESSAGE_SIZE],
 }
 
-/// Parse the secp256r1 precompile instruction data, extracting the pubkey and message.
-///
-/// This function operates on raw instruction data bytes and does **not** check the
-/// program ID. It is intended for use by `threshold.rs` when scanning multiple
-/// instructions in the transaction, as well as internally by
-/// `verify_precompile_instruction`.
-///
-/// Validates:
-/// 1. Exactly 1 signature (Phase 0)
-/// 2. All instruction_index fields == 0xFFFF (data in same instruction)
-/// 3. Valid compressed pubkey prefix (0x02 or 0x03)
-/// 4. `message_data_size == 32`
-/// 5. Offsets are in-bounds
-pub fn parse_precompile_data(data: &[u8]) -> Result<PrecompileVerifyResult, ProgramError> {
-    // Parse header: [0] = signature_count, [1] = padding
+/// Shared header / offsets / pubkey validation used by both sized and
+/// variable-length precompile parsers. Returns the parsed offsets and pubkey
+/// but does NOT slice the message — message slicing depends on whether the
+/// caller enforces a fixed size (see `parse_precompile_data_sized`) or accepts
+/// any declared size (see `parse_precompile_data_any_len`).
+fn parse_offsets_and_pubkey(
+    data: &[u8],
+) -> Result<(SignatureOffsets, [u8; PUBKEY_SIZE]), ProgramError> {
     if data.len() < HEADER_SIZE {
         return Err(MachineWalletError::InvalidPrecompileInstruction.into());
     }
-
-    let signature_count = data[0];
-    if signature_count != 1 {
-        // Phase 0: exactly one signature
+    if data[0] != 1 {
         return Err(MachineWalletError::InvalidPrecompileInstruction.into());
     }
-
-    // Parse signature offsets (starts after header)
     if data.len() < HEADER_SIZE + SIGNATURE_OFFSETS_SIZE {
         return Err(MachineWalletError::InvalidSignatureOffsets.into());
     }
-
     let offsets =
         SignatureOffsets::parse(&data[HEADER_SIZE..HEADER_SIZE + SIGNATURE_OFFSETS_SIZE])?;
 
-    // All instruction_index fields must be 0xFFFF (data in same instruction)
     if offsets.signature_instruction_index != 0xFFFF
         || offsets.public_key_instruction_index != 0xFFFF
         || offsets.message_instruction_index != 0xFFFF
@@ -106,34 +92,75 @@ pub fn parse_precompile_data(data: &[u8]) -> Result<PrecompileVerifyResult, Prog
         return Err(MachineWalletError::InvalidPrecompileInstruction.into());
     }
 
-    // Extract compressed pubkey
     let pk_start = offsets.public_key_offset as usize;
     let pk_end = pk_start + PUBKEY_SIZE;
     if pk_end > data.len() {
         return Err(MachineWalletError::InvalidSignatureOffsets.into());
     }
-
     let mut pubkey = [0u8; PUBKEY_SIZE];
     pubkey.copy_from_slice(&data[pk_start..pk_end]);
-
-    // Validate compressed pubkey prefix
     if pubkey[0] != 0x02 && pubkey[0] != 0x03 {
         return Err(MachineWalletError::PublicKeyMismatch.into());
     }
 
-    // Extract message (must be exactly 32 bytes — keccak256 hash)
-    if offsets.message_data_size as usize != MESSAGE_SIZE {
+    Ok((offsets, pubkey))
+}
+
+/// Parse a secp256r1 precompile instruction, enforcing a caller-specified message length.
+///
+/// Shared primitive for both fixed-32-byte (execute hash) and variable-length
+/// (WebAuthn `authenticatorData || SHA256(clientDataJSON)`) signed messages.
+///
+/// Validates:
+/// 1. Exactly 1 signature (Phase 0)
+/// 2. All instruction_index fields == 0xFFFF (data in same instruction)
+/// 3. Valid compressed pubkey prefix (0x02 or 0x03)
+/// 4. `message_data_size == expected_msg_len`
+/// 5. Offsets in-bounds
+///
+/// Returns `(pubkey, message_slice)`. The message slice borrows from `data`.
+pub fn parse_precompile_data_sized<'a>(
+    data: &'a [u8],
+    expected_msg_len: usize,
+) -> Result<([u8; PUBKEY_SIZE], &'a [u8]), ProgramError> {
+    let (offsets, pubkey) = parse_offsets_and_pubkey(data)?;
+
+    if offsets.message_data_size as usize != expected_msg_len {
         return Err(MachineWalletError::MessageMismatch.into());
     }
     let msg_start = offsets.message_data_offset as usize;
-    let msg_end = msg_start + MESSAGE_SIZE;
+    let msg_end = msg_start + expected_msg_len;
     if msg_end > data.len() {
         return Err(MachineWalletError::InvalidSignatureOffsets.into());
     }
 
-    let mut message = [0u8; MESSAGE_SIZE];
-    message.copy_from_slice(&data[msg_start..msg_end]);
+    Ok((pubkey, &data[msg_start..msg_end]))
+}
 
+/// Parse a secp256r1 precompile instruction without asserting a specific
+/// message length. Same validation as `parse_precompile_data_sized` except
+/// step 4 is skipped. Used for the variable-length WebAuthn match path.
+pub fn parse_precompile_data_any_len<'a>(
+    data: &'a [u8],
+) -> Result<([u8; PUBKEY_SIZE], &'a [u8]), ProgramError> {
+    let (offsets, pubkey) = parse_offsets_and_pubkey(data)?;
+
+    let msg_start = offsets.message_data_offset as usize;
+    let msg_end = msg_start
+        .checked_add(offsets.message_data_size as usize)
+        .ok_or(MachineWalletError::InvalidSignatureOffsets)?;
+    if msg_end > data.len() {
+        return Err(MachineWalletError::InvalidSignatureOffsets.into());
+    }
+
+    Ok((pubkey, &data[msg_start..msg_end]))
+}
+
+/// Parse a secp256r1 precompile signing a fixed 32-byte message (keccak256 hash).
+pub fn parse_precompile_data(data: &[u8]) -> Result<PrecompileVerifyResult, ProgramError> {
+    let (pubkey, msg_slice) = parse_precompile_data_sized(data, MESSAGE_SIZE)?;
+    let mut message = [0u8; MESSAGE_SIZE];
+    message.copy_from_slice(msg_slice);
     Ok(PrecompileVerifyResult { pubkey, message })
 }
 

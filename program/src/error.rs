@@ -39,6 +39,16 @@ pub enum MachineWalletError {
     InvalidThreshold = 34,
     AuthorityNotFound = 35,
     InvalidEd25519Pubkey = 36,
+    InvalidWebAuthnAuthData = 40,
+    InvalidWebAuthnClientDataJson = 41,
+    WebAuthnChallengeMismatch = 42,
+    WebAuthnInvalidType = 43,
+    WebAuthnUserNotPresent = 44,
+    WebAuthnDuplicateField = 45,
+    WebAuthnUserNotVerified = 46,
+    WebAuthnRpIdMismatch = 47,
+    SessionSpendCapExceeded = 48,
+    TooManyWebAuthnEvidence = 50,
 }
 
 impl From<MachineWalletError> for ProgramError {
@@ -92,6 +102,28 @@ impl std::fmt::Display for MachineWalletError {
             Self::InvalidThreshold => write!(f, "Invalid threshold value"),
             Self::AuthorityNotFound => write!(f, "Authority not found"),
             Self::InvalidEd25519Pubkey => write!(f, "Invalid Ed25519 public key"),
+            Self::InvalidWebAuthnAuthData => write!(f, "Invalid WebAuthn authenticatorData"),
+            Self::InvalidWebAuthnClientDataJson => write!(f, "Invalid WebAuthn clientDataJSON"),
+            Self::WebAuthnChallengeMismatch => write!(f, "WebAuthn challenge mismatch"),
+            Self::WebAuthnInvalidType => write!(f, "WebAuthn type must be webauthn.get"),
+            Self::WebAuthnUserNotPresent => {
+                write!(f, "WebAuthn authenticatorData UP flag must be set")
+            }
+            Self::WebAuthnDuplicateField => {
+                write!(f, "WebAuthn clientDataJSON contains duplicate key")
+            }
+            Self::WebAuthnUserNotVerified => {
+                write!(f, "WebAuthn authenticatorData UV flag must be set")
+            }
+            Self::WebAuthnRpIdMismatch => {
+                write!(f, "WebAuthn rpIdHash does not match expected RP")
+            }
+            Self::SessionSpendCapExceeded => {
+                write!(f, "Session cumulative spend cap exceeded")
+            }
+            Self::TooManyWebAuthnEvidence => {
+                write!(f, "Too many ProvideWebAuthnEvidence sidecar instructions")
+            }
         }
     }
 }
@@ -148,5 +180,15 @@ mod tests {
         assert_eq!(MachineWalletError::InvalidThreshold as u32, 34);
         assert_eq!(MachineWalletError::AuthorityNotFound as u32, 35);
         assert_eq!(MachineWalletError::InvalidEd25519Pubkey as u32, 36);
+        assert_eq!(MachineWalletError::InvalidWebAuthnAuthData as u32, 40);
+        assert_eq!(MachineWalletError::InvalidWebAuthnClientDataJson as u32, 41);
+        assert_eq!(MachineWalletError::WebAuthnChallengeMismatch as u32, 42);
+        assert_eq!(MachineWalletError::WebAuthnInvalidType as u32, 43);
+        assert_eq!(MachineWalletError::WebAuthnUserNotPresent as u32, 44);
+        assert_eq!(MachineWalletError::WebAuthnDuplicateField as u32, 45);
+        assert_eq!(MachineWalletError::WebAuthnUserNotVerified as u32, 46);
+        assert_eq!(MachineWalletError::WebAuthnRpIdMismatch as u32, 47);
+        assert_eq!(MachineWalletError::SessionSpendCapExceeded as u32, 48);
+        assert_eq!(MachineWalletError::TooManyWebAuthnEvidence as u32, 50);
     }
 }

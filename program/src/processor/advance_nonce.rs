@@ -99,9 +99,10 @@ pub fn process(
         max_slot,
     );
 
-    // 8. Signature verification (v0: single precompile, v1: threshold scan)
+    // 8. Signature verification.
     threshold::verify_wallet_signatures(
         instructions_sysvar,
+        program_id,
         &wallet,
         secp256r1_ix_index,
         &expected_message,

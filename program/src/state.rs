@@ -16,6 +16,10 @@ pub const SIG_SCHEME_SECP256R1: u8 = 0;
 /// Ed25519 signature scheme identifier.
 pub const SIG_SCHEME_ED25519: u8 = 1;
 
+/// WebAuthn Passkey signature scheme identifier.
+/// Uses the same P-256 key format as SECP256R1, but with WebAuthn message wrapping.
+pub const SIG_SCHEME_WEBAUTHN: u8 = 2;
+
 /// Maximum number of authorities in a multi-authority wallet.
 pub const MAX_AUTHORITIES: u8 = 16;
 
@@ -44,7 +48,9 @@ impl AuthoritySlot {
     /// Validate this authority slot based on its signature scheme.
     pub fn is_valid(&self) -> bool {
         match self.sig_scheme {
-            SIG_SCHEME_SECP256R1 => MachineWallet::is_valid_authority(&self.pubkey),
+            SIG_SCHEME_SECP256R1 | SIG_SCHEME_WEBAUTHN => {
+                MachineWallet::is_valid_authority(&self.pubkey)
+            }
             SIG_SCHEME_ED25519 => Self::is_valid_ed25519(&self.pubkey),
             _ => false,
         }
@@ -110,6 +116,29 @@ pub struct MachineWallet {
 impl MachineWallet {
     /// Total serialized size in bytes for v0 (fixed part, single authority).
     pub const LEN: usize = 1 + 1 + 32 + 1 + 1 + 1 + 33 + 8 + 8 + 1; // 87
+
+    /// Sentinel version byte written by `close_wallet` to make the PDA a
+    /// permanent tombstone. Chosen as 0xFF because:
+    ///
+    ///   1. It cannot collide with any valid layout version (currently 0 or 1,
+    ///      future versions must stay monotonically small).
+    ///   2. `deserialize_runtime` already dispatches on `src[0]` and returns
+    ///      `InvalidAccountData` for any unknown version, so every
+    ///      state-reading processor (Execute, AdvanceNonce, CreateSession,
+    ///      SessionExecute, RevokeSession, AddAuthority, RemoveAuthority,
+    ///      SetThreshold, OwnerCloseSession, CloseWallet) fails closed on a
+    ///      tombstoned PDA *without* needing per-processor guards.
+    ///   3. Combined with preserving `program_id` ownership + rent-exempt
+    ///      lamports, the runtime never zero-lamport-GCs the account, so
+    ///      `init_pda_account` (which short-circuits on
+    ///      `pda_account.owner == program_id`) can never accept a
+    ///      `CreateWallet` for the same PDA seeds — not in the next slot,
+    ///      not in the next year.
+    ///
+    /// See `processor::close_wallet` for the full tombstone-invariant
+    /// rationale (why this is the first-principles fix for
+    /// close-then-recreate replay of pre-signed Executes).
+    pub const CLOSED_MARKER: u8 = 0xFF;
 
     // --- V0 offsets (kept for backward compatibility and migration) ---
 
@@ -224,7 +253,9 @@ impl MachineWallet {
 
     /// Deserialize v0 layout (existing 87-byte single-authority format).
     fn deserialize_v0(src: &[u8], validate: bool) -> Result<Self, ProgramError> {
-        if src.len() < Self::LEN {
+        // Exact-length equality (not `<`): rejects trailing bytes so a single
+        // byte string cannot deserialize into multiple valid v0 representations.
+        if src.len() != Self::LEN {
             return Err(ProgramError::AccountDataTooSmall);
         }
 
@@ -324,8 +355,12 @@ impl MachineWallet {
             return Err(ProgramError::InvalidAccountData);
         }
 
+        // Exact-length equality rejects trailing bytes. Combined with the
+        // realloc path that always sizes to `v1_account_size(authority_count)`,
+        // this means the on-chain account byte-length must mirror the
+        // declared `authority_count` — no stale-slot shadowing possible.
         let required_size = Self::v1_account_size(authority_count);
-        if src.len() < required_size {
+        if src.len() != required_size {
             return Err(ProgramError::AccountDataTooSmall);
         }
 
@@ -348,6 +383,18 @@ impl MachineWallet {
         for i in 0..authority_count as usize {
             let offset = V1_HEADER_SIZE + i * AUTHORITY_SLOT_SIZE;
             let sig_scheme = src[offset];
+            // Runtime-path validation of sig_scheme: only the three declared
+            // schemes are accepted for active slots. An unknown value would
+            // silently skip threshold matching (the scanner compares against
+            // explicit constants), allowing a corrupted-storage bug to lock
+            // users out of their wallet. Reject at deserialize rather than
+            // letting the invariant leak into match-time code.
+            if sig_scheme != SIG_SCHEME_SECP256R1
+                && sig_scheme != SIG_SCHEME_ED25519
+                && sig_scheme != SIG_SCHEME_WEBAUTHN
+            {
+                return Err(ProgramError::InvalidAccountData);
+            }
             let mut pubkey = [0u8; 33];
             pubkey.copy_from_slice(&src[offset + 1..offset + 1 + 33]);
             authorities[i] = AuthoritySlot { sig_scheme, pubkey };
@@ -440,21 +487,38 @@ pub const MAX_ALLOWED_PROGRAMS: usize = 8;
 /// Session PDA seed prefix.
 pub const SESSION_SEED_PREFIX: &[u8] = b"machine_session";
 
-/// SessionState on-chain state.
+/// SessionState on-chain state — **variable size** based on `allowed_programs_count`.
 ///
-/// Layout (420 bytes total):
-/// - version:               u8          (offset 0)   — state version, must be 0
-/// - bump:                  u8          (offset 1)   — session PDA bump seed
-/// - wallet:                [u8; 32]    (offset 2)   — wallet PDA address
-/// - authority:             [u8; 32]    (offset 34)  — session authority (Ed25519 pubkey)
-/// - created_slot:          u64         (offset 66)  — slot at creation
-/// - expiry_slot:           u64         (offset 74)  — slot at which session expires
-/// - revoked:               bool/u8     (offset 82)  — non-zero means revoked
-/// - wallet_creation_slot:  u64         (offset 83)  — wallet's creation_slot, prevents session resurrection
-/// - max_lamports_per_ix:   u64         (offset 91)  — per-instruction lamport spend cap
-/// - allowed_programs_count: u8         (offset 99)  — number of whitelisted programs (≤ MAX_ALLOWED_PROGRAMS)
-/// - allowed_programs:      [[u8;32];8] (offset 100) — whitelisted program IDs (8 × 32 = 256 bytes)
-/// - reserved:              [u8; 64]    (offset 356) — reserved, always zero
+/// Dynamic layout (116 + count*32 bytes total):
+/// - version:                    u8          (offset 0)                 — state version, must be 0
+/// - bump:                       u8          (offset 1)                 — session PDA bump seed
+/// - wallet:                     [u8; 32]    (offset 2)                 — wallet PDA address
+/// - authority:                  [u8; 32]    (offset 34)                — session authority (Ed25519 pubkey)
+/// - created_slot:               u64         (offset 66)                — slot at creation
+/// - expiry_slot:                u64         (offset 74)                — slot at which session expires
+/// - revoked:                    bool/u8     (offset 82)                — non-zero means revoked
+/// - wallet_creation_slot:       u64         (offset 83)                — wallet's creation_slot, prevents session resurrection
+/// - max_lamports_per_call:      u64         (offset 91)                — net outflow cap per SessionExecute invocation (0 = unlimited)
+/// - allowed_programs_count:     u8          (offset 99)                — number of whitelisted programs (1..=MAX_ALLOWED_PROGRAMS)
+/// - allowed_programs:           [[u8;32];N] (offset 100)               — exactly `count` × 32 bytes
+/// - max_total_spent_lamports:   u64         (offset 100 + count*32)    — lifetime cumulative outflow cap (0 = unlimited)
+/// - total_spent_lamports:       u64         (offset 108 + count*32)    — cumulative lamports withdrawn via this session
+///
+/// **Rent optimization**: a 1-program session is 148 B (vs previous fixed 420 B),
+/// saving ~272 B × rent_per_byte per session. 8-program session is 372 B.
+///
+/// **Length-as-integrity**: `deserialize_inner` enforces `src.len() == size(count)`.
+/// Combined with program-owned-account writes only, this prevents any stale-byte
+/// shadowing or trailing-byte malleability.
+///
+/// Spend-cap semantics:
+/// - `max_lamports_per_call` bounds the net vault outflow per single SessionExecute
+///   invocation. It does NOT aggregate across multiple SessionExecute instructions
+///   packed in the same transaction — each call is independently capped.
+/// - `max_total_spent_lamports` bounds the cumulative lifetime outflow across all
+///   SessionExecute calls made under this session. Enforced only when > 0.
+///   When enforced, `session_account` must be writable so the processor can
+///   persist the updated `total_spent_lamports` counter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionState {
     pub version: u8,
@@ -465,22 +529,87 @@ pub struct SessionState {
     pub expiry_slot: u64,
     pub revoked: bool,
     pub wallet_creation_slot: u64,
-    pub max_lamports_per_ix: u64,
+    pub max_lamports_per_call: u64,
     pub allowed_programs_count: u8,
     pub allowed_programs: [[u8; 32]; MAX_ALLOWED_PROGRAMS],
+    pub max_total_spent_lamports: u64,
+    pub total_spent_lamports: u64,
 }
 
 impl SessionState {
-    /// Total serialized size in bytes.
-    /// 1+1+32+32+8+8+1+8+8+1+256+64 = 420
-    pub const LEN: usize = 420;
+    /// Size of the fixed header preceding the variable-length allowed_programs.
+    /// Covers offsets 0..100 (version, bump, wallet, authority, created_slot,
+    /// expiry_slot, revoked, wallet_creation_slot, max_lamports_per_call,
+    /// allowed_programs_count).
+    pub const HEADER_SIZE: usize = 100;
 
-    /// Byte offset of the revoked field within serialized state.
+    /// Size of the tail following the variable-length allowed_programs region.
+    /// Covers max_total_spent_lamports (8B) + total_spent_lamports (8B).
+    pub const TAIL_SIZE: usize = 16;
+
+    /// Byte offset of the revoked field within serialized state (static).
     pub const REVOKED_OFFSET: usize = 82;
 
-    /// Serialize into a byte buffer. Zeros reserved region explicitly.
+    /// Minimum serialized size (a session with exactly 1 allowed program).
+    /// 1-program session is the legal minimum because allowed_programs_count
+    /// must be ≥ 1.
+    pub const MIN_SIZE: usize = Self::HEADER_SIZE + 32 + Self::TAIL_SIZE;
+
+    /// Maximum serialized size (a session with MAX_ALLOWED_PROGRAMS programs).
+    pub const MAX_SIZE: usize = Self::HEADER_SIZE + MAX_ALLOWED_PROGRAMS * 32 + Self::TAIL_SIZE;
+
+    /// Total serialized size for a session with the given `allowed_programs_count`.
+    /// Callers (CreateSession) compute the exact rent requirement via this.
+    #[inline]
+    pub const fn size(allowed_programs_count: u8) -> usize {
+        Self::HEADER_SIZE + (allowed_programs_count as usize) * 32 + Self::TAIL_SIZE
+    }
+
+    /// Byte offset of `max_total_spent_lamports` within serialized state.
+    /// Depends on count because the field sits after the variable-length
+    /// allowed_programs region.
+    #[inline]
+    pub const fn max_total_spent_offset(allowed_programs_count: u8) -> usize {
+        Self::HEADER_SIZE + (allowed_programs_count as usize) * 32
+    }
+
+    /// Byte offset of `total_spent_lamports` within serialized state.
+    /// Hot-path writers (session_execute) update this in place without
+    /// re-serializing the whole struct.
+    #[inline]
+    pub const fn total_spent_offset(allowed_programs_count: u8) -> usize {
+        Self::max_total_spent_offset(allowed_programs_count) + 8
+    }
+
+    /// In-place update of `total_spent_lamports` in a serialized session
+    /// account buffer. Lets callers (session_execute hot path) persist the
+    /// cumulative spend counter without re-serializing the whole struct and
+    /// without depending on the raw byte layout.
+    pub fn write_total_spent(
+        data: &mut [u8],
+        allowed_programs_count: u8,
+        new_total: u64,
+    ) -> Result<(), ProgramError> {
+        let off = Self::total_spent_offset(allowed_programs_count);
+        if data.len() < off + 8 {
+            return Err(ProgramError::AccountDataTooSmall);
+        }
+        data[off..off + 8].copy_from_slice(&new_total.to_le_bytes());
+        Ok(())
+    }
+
+    /// Convenience: serialized size for this instance.
+    #[inline]
+    pub fn serialized_size(&self) -> usize {
+        Self::size(self.allowed_programs_count)
+    }
+
+    /// Serialize into a byte buffer sized exactly for this session's
+    /// `allowed_programs_count`. No reserved tail — the buffer holds only
+    /// active fields.
     pub fn serialize(&self, dst: &mut [u8]) -> Result<(), ProgramError> {
-        if dst.len() < Self::LEN {
+        let required = self.serialized_size();
+        if dst.len() < required {
             return Err(ProgramError::AccountDataTooSmall);
         }
 
@@ -492,21 +621,21 @@ impl SessionState {
         dst[74..82].copy_from_slice(&self.expiry_slot.to_le_bytes());
         dst[Self::REVOKED_OFFSET] = self.revoked as u8;
         dst[83..91].copy_from_slice(&self.wallet_creation_slot.to_le_bytes());
-        dst[91..99].copy_from_slice(&self.max_lamports_per_ix.to_le_bytes());
+        dst[91..99].copy_from_slice(&self.max_lamports_per_call.to_le_bytes());
         dst[99] = self.allowed_programs_count;
-        // Only write active program entries; zero the rest + reserved region in one fill
-        let active_end = 100 + self.allowed_programs_count as usize * 32;
         for (i, prog) in self
             .allowed_programs
             .iter()
             .take(self.allowed_programs_count as usize)
             .enumerate()
         {
-            let start = 100 + i * 32;
+            let start = Self::HEADER_SIZE + i * 32;
             dst[start..start + 32].copy_from_slice(prog);
         }
-        // Zero unused program slots + reserved region (active_end..420) in one call
-        dst[active_end..420].fill(0);
+        let max_off = Self::max_total_spent_offset(self.allowed_programs_count);
+        let total_off = Self::total_spent_offset(self.allowed_programs_count);
+        dst[max_off..max_off + 8].copy_from_slice(&self.max_total_spent_lamports.to_le_bytes());
+        dst[total_off..total_off + 8].copy_from_slice(&self.total_spent_lamports.to_le_bytes());
         Ok(())
     }
 
@@ -526,7 +655,9 @@ impl SessionState {
     }
 
     fn deserialize_inner(src: &[u8], validate: bool) -> Result<Self, ProgramError> {
-        if src.len() < Self::LEN {
+        // Minimum-size gate: must at least hold the fixed header so we can
+        // safely read the count byte at offset 99.
+        if src.len() < Self::HEADER_SIZE {
             return Err(ProgramError::AccountDataTooSmall);
         }
 
@@ -543,27 +674,36 @@ impl SessionState {
         let mut authority = [0u8; 32];
         authority.copy_from_slice(&src[34..66]);
 
-        // Length already validated ≥ 420; these slices are guaranteed 8 bytes.
+        // Header ≥ 100 already verified; these slices are guaranteed 8 bytes.
         let created_slot = u64::from_le_bytes(src[66..74].try_into().unwrap());
         let expiry_slot = u64::from_le_bytes(src[74..82].try_into().unwrap());
 
         let revoked = src[Self::REVOKED_OFFSET] != 0;
 
         let wallet_creation_slot = u64::from_le_bytes(src[83..91].try_into().unwrap());
-        let max_lamports_per_ix = u64::from_le_bytes(src[91..99].try_into().unwrap());
+        let max_lamports_per_call = u64::from_le_bytes(src[91..99].try_into().unwrap());
 
         let allowed_programs_count = src[99];
         if allowed_programs_count == 0 || allowed_programs_count as usize > MAX_ALLOWED_PROGRAMS {
             return Err(ProgramError::InvalidAccountData);
         }
+
+        // Exact-length equality once count is known. Combined with program-
+        // owned writes that always size to `size(count)`, this means the
+        // on-chain byte length must mirror the declared count — no stale-slot
+        // shadowing, no trailing-byte malleability.
+        let required_size = Self::size(allowed_programs_count);
+        if src.len() != required_size {
+            return Err(ProgramError::AccountDataTooSmall);
+        }
+
         if wallet == [0u8; 32] || authority == [0u8; 32] || created_slot > expiry_slot {
             return Err(ProgramError::InvalidAccountData);
         }
 
-        // Only read `allowed_programs_count` entries, not all 8 — saves up to 224 bytes of reads
         let mut allowed_programs = [[0u8; 32]; MAX_ALLOWED_PROGRAMS];
         for i in 0..allowed_programs_count as usize {
-            let start = 100 + i * 32;
+            let start = Self::HEADER_SIZE + i * 32;
             allowed_programs[i].copy_from_slice(&src[start..start + 32]);
             if validate {
                 for prev in allowed_programs.iter().take(i) {
@@ -572,6 +712,18 @@ impl SessionState {
                     }
                 }
             }
+        }
+
+        let max_off = Self::max_total_spent_offset(allowed_programs_count);
+        let total_off = Self::total_spent_offset(allowed_programs_count);
+        let max_total_spent_lamports =
+            u64::from_le_bytes(src[max_off..max_off + 8].try_into().unwrap());
+        let total_spent_lamports =
+            u64::from_le_bytes(src[total_off..total_off + 8].try_into().unwrap());
+        // Invariant: total_spent must never exceed the cap (when cap > 0).
+        // A violation implies a prior write bypassed the check — fail closed.
+        if max_total_spent_lamports > 0 && total_spent_lamports > max_total_spent_lamports {
+            return Err(ProgramError::InvalidAccountData);
         }
 
         Ok(Self {
@@ -583,9 +735,11 @@ impl SessionState {
             expiry_slot,
             revoked,
             wallet_creation_slot,
-            max_lamports_per_ix,
+            max_lamports_per_call,
             allowed_programs_count,
             allowed_programs,
+            max_total_spent_lamports,
+            total_spent_lamports,
         })
     }
 
@@ -1199,21 +1353,53 @@ mod tests {
             expiry_slot: 200,
             revoked: false,
             wallet_creation_slot: 50,
-            max_lamports_per_ix: 1_000_000,
+            max_lamports_per_call: 1_000_000,
             allowed_programs_count: 2,
             allowed_programs,
+            max_total_spent_lamports: 0,
+            total_spent_lamports: 0,
         }
     }
 
     #[test]
     fn test_session_state_size() {
-        assert_eq!(SessionState::LEN, 420);
+        // Dynamic layout: 116 + count*32.
+        assert_eq!(SessionState::MIN_SIZE, 148); // 1 program
+        assert_eq!(SessionState::MAX_SIZE, 372); // 8 programs
+        assert_eq!(SessionState::size(1), 148);
+        assert_eq!(SessionState::size(2), 180);
+        assert_eq!(SessionState::size(8), 372);
+        // 1-program session saves 272 bytes of rent vs the former fixed 420-byte layout.
+    }
+
+    #[test]
+    fn test_session_offsets_are_count_dependent() {
+        // Tail field offsets shift with allowed_programs_count.
+        assert_eq!(SessionState::max_total_spent_offset(1), 132);
+        assert_eq!(SessionState::total_spent_offset(1), 140);
+        assert_eq!(SessionState::max_total_spent_offset(8), 356);
+        assert_eq!(SessionState::total_spent_offset(8), 364);
+    }
+
+    #[test]
+    fn test_session_rejects_length_mismatch() {
+        // A byte buffer that passes count validation but is one byte shorter
+        // than `size(count)` must be rejected — the length-as-integrity check
+        // is load-bearing for preventing stale-slot shadowing.
+        let session = make_session(); // count == 2 → size == 180
+        let mut buf = vec![0u8; session.serialized_size()];
+        session.serialize(&mut buf).unwrap();
+        buf.pop(); // now 179 bytes, count byte still claims 2 → mismatch
+        assert_eq!(
+            SessionState::deserialize(&buf).unwrap_err(),
+            ProgramError::AccountDataTooSmall
+        );
     }
 
     #[test]
     fn test_session_state_roundtrip() {
         let session = make_session();
-        let mut buf = [0u8; SessionState::LEN];
+        let mut buf = vec![0u8; session.serialized_size()];
         session.serialize(&mut buf).unwrap();
 
         let decoded = SessionState::deserialize(&buf).unwrap();
@@ -1224,7 +1410,9 @@ mod tests {
         assert_eq!(decoded.expiry_slot, 200);
         assert!(!decoded.revoked);
         assert_eq!(decoded.wallet_creation_slot, 50);
-        assert_eq!(decoded.max_lamports_per_ix, 1_000_000);
+        assert_eq!(decoded.max_lamports_per_call, 1_000_000);
+        assert_eq!(decoded.max_total_spent_lamports, 0);
+        assert_eq!(decoded.total_spent_lamports, 0);
         assert_eq!(decoded.allowed_programs_count, 2);
     }
 
@@ -1243,7 +1431,7 @@ mod tests {
     #[test]
     fn test_session_rejects_too_many_programs() {
         let session = make_session();
-        let mut buf = [0u8; SessionState::LEN];
+        let mut buf = vec![0u8; session.serialized_size()];
         session.serialize(&mut buf).unwrap();
         // Set allowed_programs_count to 9 (> MAX_ALLOWED_PROGRAMS = 8)
         buf[99] = 9;
@@ -1255,7 +1443,7 @@ mod tests {
     fn test_session_revoked_flag() {
         // revoked = false roundtrip
         let session = make_session();
-        let mut buf = [0u8; SessionState::LEN];
+        let mut buf = vec![0u8; session.serialized_size()];
         session.serialize(&mut buf).unwrap();
         let decoded = SessionState::deserialize(&buf).unwrap();
         assert!(!decoded.revoked);
@@ -1263,7 +1451,7 @@ mod tests {
         // revoked = true roundtrip
         let mut revoked_session = session.clone();
         revoked_session.revoked = true;
-        let mut buf2 = [0u8; SessionState::LEN];
+        let mut buf2 = vec![0u8; revoked_session.serialized_size()];
         revoked_session.serialize(&mut buf2).unwrap();
         assert_eq!(buf2[SessionState::REVOKED_OFFSET], 1);
         let decoded2 = SessionState::deserialize(&buf2).unwrap();
@@ -1273,7 +1461,7 @@ mod tests {
     #[test]
     fn test_session_rejects_zero_allowed_programs_count() {
         let session = make_session();
-        let mut buf = [0u8; SessionState::LEN];
+        let mut buf = vec![0u8; session.serialized_size()];
         session.serialize(&mut buf).unwrap();
         buf[99] = 0;
         let result = SessionState::deserialize(&buf);
@@ -1284,7 +1472,7 @@ mod tests {
     fn test_session_rejects_zero_wallet_or_authority() {
         let mut session = make_session();
         session.wallet = [0u8; 32];
-        let mut buf = [0u8; SessionState::LEN];
+        let mut buf = vec![0u8; session.serialized_size()];
         session.serialize(&mut buf).unwrap();
         assert_eq!(
             SessionState::deserialize(&buf).unwrap_err(),
@@ -1293,7 +1481,7 @@ mod tests {
 
         let mut session = make_session();
         session.authority = [0u8; 32];
-        let mut buf = [0u8; SessionState::LEN];
+        let mut buf = vec![0u8; session.serialized_size()];
         session.serialize(&mut buf).unwrap();
         assert_eq!(
             SessionState::deserialize(&buf).unwrap_err(),
@@ -1305,7 +1493,7 @@ mod tests {
     fn test_session_rejects_duplicate_program_ids() {
         let mut session = make_session();
         session.allowed_programs[1] = session.allowed_programs[0];
-        let mut buf = [0u8; SessionState::LEN];
+        let mut buf = vec![0u8; session.serialized_size()];
         session.serialize(&mut buf).unwrap();
         assert_eq!(
             SessionState::deserialize(&buf).unwrap_err(),
@@ -1318,7 +1506,7 @@ mod tests {
         // System Program address is [0u8; 32] — must be accepted as a valid allowed program
         let mut session = make_session();
         session.allowed_programs[0] = [0u8; 32]; // System Program
-        let mut buf = [0u8; SessionState::LEN];
+        let mut buf = vec![0u8; session.serialized_size()];
         session.serialize(&mut buf).unwrap();
         let decoded = SessionState::deserialize(&buf).unwrap();
         assert_eq!(decoded.allowed_programs[0], [0u8; 32]);
@@ -1329,7 +1517,7 @@ mod tests {
         let mut session = make_session();
         session.created_slot = 201;
         session.expiry_slot = 200;
-        let mut buf = [0u8; SessionState::LEN];
+        let mut buf = vec![0u8; session.serialized_size()];
         session.serialize(&mut buf).unwrap();
         assert_eq!(
             SessionState::deserialize(&buf).unwrap_err(),

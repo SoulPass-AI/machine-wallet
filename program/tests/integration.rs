@@ -211,14 +211,16 @@ fn build_create_session_ix(
     max_slot: u64,
     session_authority: &Pubkey,
     expiry_slot: u64,
-    max_lamports_per_ix: u64,
+    max_lamports_per_call: u64,
+    max_total_spent_lamports: u64,
     allowed_programs: &[Pubkey],
 ) -> Instruction {
     let mut data = vec![4u8, precompile_ix_index];
     data.extend_from_slice(&max_slot.to_le_bytes());
     data.extend_from_slice(session_authority.as_ref());
     data.extend_from_slice(&expiry_slot.to_le_bytes());
-    data.extend_from_slice(&max_lamports_per_ix.to_le_bytes());
+    data.extend_from_slice(&max_lamports_per_call.to_le_bytes());
+    data.extend_from_slice(&max_total_spent_lamports.to_le_bytes());
     data.push(allowed_programs.len() as u8);
     for program_id in allowed_programs {
         data.extend_from_slice(program_id.as_ref());
@@ -535,7 +537,33 @@ async fn create_session_helper(
     wallet_pda: &Pubkey,
     session_authority: &Keypair,
     expiry_slot: u64,
-    max_lamports_per_ix: u64,
+    max_lamports_per_call: u64,
+    allowed_programs: &[Pubkey],
+) -> Pubkey {
+    create_session_helper_full(
+        banks,
+        payer,
+        owner,
+        wallet_pda,
+        session_authority,
+        expiry_slot,
+        max_lamports_per_call,
+        0, // max_total_spent_lamports = 0 → lifetime cap disabled (legacy behavior)
+        allowed_programs,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn create_session_helper_full(
+    banks: &mut BanksClient,
+    payer: &Keypair,
+    owner: &Keypair,
+    wallet_pda: &Pubkey,
+    session_authority: &Keypair,
+    expiry_slot: u64,
+    max_lamports_per_call: u64,
+    max_total_spent_lamports: u64,
     allowed_programs: &[Pubkey],
 ) -> Pubkey {
     let wallet = read_wallet_state(banks, wallet_pda).await;
@@ -547,7 +575,8 @@ async fn create_session_helper(
     let session_data_hash = create_session::hash_session_data(
         &session_authority.pubkey().to_bytes(),
         expiry_slot,
-        max_lamports_per_ix,
+        max_lamports_per_call,
+        max_total_spent_lamports,
         allowed_program_bytes.len() as u8,
         &allowed_program_bytes,
     );
@@ -569,7 +598,8 @@ async fn create_session_helper(
                 u64::MAX,
                 &session_authority.pubkey(),
                 expiry_slot,
-                max_lamports_per_ix,
+                max_lamports_per_call,
+                max_total_spent_lamports,
                 allowed_programs,
             ),
         ],
@@ -1213,7 +1243,156 @@ async fn test_create_session_allows_zero_max_lamports_for_uncapped_mode() {
     )
     .await;
     let session = read_session_state(&mut banks, &session_pda).await;
-    assert_eq!(session.max_lamports_per_ix, 0);
+    assert_eq!(session.max_lamports_per_call, 0);
+}
+
+/// Lifetime cumulative spend cap must bound TOTAL outflow across multiple
+/// SessionExecute calls. This closes the "stack N SessionExecute ixs to bypass
+/// per-call cap" attack surface for compromised session keys.
+#[tokio::test]
+async fn test_session_execute_enforces_lifetime_spend_cap() {
+    let (mut banks, payer, _) = program_test().start().await;
+    let owner = Keypair::new();
+    let session_authority = Keypair::new();
+    let recipient = Keypair::new();
+    let (wallet_pda, vault_pda) = create_ed25519_wallet_helper(&mut banks, &payer, &owner).await;
+    let wallet = read_wallet_state(&mut banks, &wallet_pda).await;
+
+    // Per-call cap = 200M; lifetime cap = 500M.
+    // Three 200M transfers: 200 + 200 = 400 (ok), third 200 → 600 > 500 = reject.
+    let session_pda = create_session_helper_full(
+        &mut banks,
+        &payer,
+        &owner,
+        &wallet_pda,
+        &session_authority,
+        wallet.creation_slot + 500,
+        200_000_000, // max_lamports_per_call
+        500_000_000, // max_total_spent_lamports
+        &[system_program::id()],
+    )
+    .await;
+
+    let fund_vault_tx = Transaction::new_signed_with_payer(
+        &[system_instruction::transfer(
+            &payer.pubkey(),
+            &vault_pda,
+            2_000_000_000,
+        )],
+        Some(&payer.pubkey()),
+        &[&payer],
+        banks.get_latest_blockhash().await.unwrap(),
+    );
+    banks.process_transaction(fund_vault_tx).await.unwrap();
+
+    // Sanity: confirm lifetime cap was actually stored.
+    let session_initial = read_session_state(&mut banks, &session_pda).await;
+    assert_eq!(session_initial.max_lamports_per_call, 200_000_000);
+    assert_eq!(session_initial.max_total_spent_lamports, 500_000_000);
+    assert_eq!(session_initial.total_spent_lamports, 0);
+
+    // Call 1: 200M, cumulative = 200M — ok.
+    let inner1 = make_inner(
+        system_program::id().to_bytes(),
+        &[
+            (0, AccountEntry::FLAG_WRITABLE),
+            (1, AccountEntry::FLAG_WRITABLE),
+        ],
+        system_instruction::transfer(&vault_pda, &recipient.pubkey(), 200_000_000).data,
+    );
+    let bh1 = banks.get_latest_blockhash().await.unwrap();
+    let tx1 = Transaction::new_signed_with_payer(
+        &[build_session_execute_ix(
+            &session_pda,
+            &wallet_pda,
+            &session_authority.pubkey(),
+            &vault_pda,
+            &[inner1],
+            &[
+                AccountMeta::new(vault_pda, false),
+                AccountMeta::new(recipient.pubkey(), false),
+                AccountMeta::new_readonly(system_program::id(), false),
+            ],
+        )],
+        Some(&payer.pubkey()),
+        &[&payer, &session_authority],
+        bh1,
+    );
+    banks.process_transaction(tx1).await.unwrap();
+    let session_after_1 = read_session_state(&mut banks, &session_pda).await;
+    assert_eq!(session_after_1.total_spent_lamports, 200_000_000);
+    assert_eq!(session_after_1.max_total_spent_lamports, 500_000_000);
+
+    // Call 2: 200M, cumulative = 400M — ok.
+    // BanksClient reuses the same blockhash for identical ix data → duplicate sig.
+    // We use a fresh recipient/different amount to avoid sig collision.
+    let recipient2 = Keypair::new();
+    let transfer_amount2: u64 = 200_000_000;
+    let inner2 = make_inner(
+        system_program::id().to_bytes(),
+        &[
+            (0, AccountEntry::FLAG_WRITABLE),
+            (1, AccountEntry::FLAG_WRITABLE),
+        ],
+        system_instruction::transfer(&vault_pda, &recipient2.pubkey(), transfer_amount2).data,
+    );
+    let bh2 = banks.get_latest_blockhash().await.unwrap();
+    let tx2 = Transaction::new_signed_with_payer(
+        &[build_session_execute_ix(
+            &session_pda,
+            &wallet_pda,
+            &session_authority.pubkey(),
+            &vault_pda,
+            &[inner2],
+            &[
+                AccountMeta::new(vault_pda, false),
+                AccountMeta::new(recipient2.pubkey(), false),
+                AccountMeta::new_readonly(system_program::id(), false),
+            ],
+        )],
+        Some(&payer.pubkey()),
+        &[&payer, &session_authority],
+        bh2,
+    );
+    let r2 = banks.process_transaction(tx2).await;
+    assert!(r2.is_ok(), "Call 2 unexpectedly failed: {:?}", r2);
+    let session_after_2 = read_session_state(&mut banks, &session_pda).await;
+    assert_eq!(session_after_2.total_spent_lamports, 400_000_000);
+
+    // Call 3: would take cumulative to 600M, exceeds 500M cap — rejected.
+    let recipient3 = Keypair::new();
+    let inner3 = make_inner(
+        system_program::id().to_bytes(),
+        &[
+            (0, AccountEntry::FLAG_WRITABLE),
+            (1, AccountEntry::FLAG_WRITABLE),
+        ],
+        system_instruction::transfer(&vault_pda, &recipient3.pubkey(), 200_000_000).data,
+    );
+    let bh3 = banks.get_latest_blockhash().await.unwrap();
+    let tx3 = Transaction::new_signed_with_payer(
+        &[build_session_execute_ix(
+            &session_pda,
+            &wallet_pda,
+            &session_authority.pubkey(),
+            &vault_pda,
+            &[inner3],
+            &[
+                AccountMeta::new(vault_pda, false),
+                AccountMeta::new(recipient3.pubkey(), false),
+                AccountMeta::new_readonly(system_program::id(), false),
+            ],
+        )],
+        Some(&payer.pubkey()),
+        &[&payer, &session_authority],
+        bh3,
+    );
+    let result = banks.process_transaction(tx3).await;
+    assert!(result.is_err(), "Third call should be rejected (lifetime cap exceeded)");
+
+    // State must remain at 400M — failed tx rolled back atomically.
+    let session_after_3 = read_session_state(&mut banks, &session_pda).await;
+    assert_eq!(session_after_3.total_spent_lamports, 400_000_000);
 }
 
 #[tokio::test]
@@ -3071,7 +3250,7 @@ fn test_create_session_message_deterministic() {
     let wallet = Pubkey::new_unique();
     let authority = [0x42u8; 32];
     let programs = vec![[0xAAu8; 32], [0xBBu8; 32]];
-    let data_hash = create_session::hash_session_data(&authority, 500, 1_000_000_000, 2, &programs);
+    let data_hash = create_session::hash_session_data(&authority, 500, 1_000_000_000, 0, 2, &programs);
     let msg1 = create_session::compute_create_session_message(&wallet, 100, 0, 200, &data_hash);
     let msg2 = create_session::compute_create_session_message(&wallet, 100, 0, 200, &data_hash);
     assert_eq!(msg1, msg2);
@@ -3082,7 +3261,7 @@ fn test_create_session_message_includes_nonce() {
     let wallet = Pubkey::new_unique();
     let authority = [0x42u8; 32];
     let programs = vec![[0xAAu8; 32]];
-    let data_hash = create_session::hash_session_data(&authority, 500, 0, 1, &programs);
+    let data_hash = create_session::hash_session_data(&authority, 500, 0, 0, 1, &programs);
     let msg1 = create_session::compute_create_session_message(&wallet, 100, 0, 200, &data_hash);
     let msg2 = create_session::compute_create_session_message(&wallet, 100, 1, 200, &data_hash);
     assert_ne!(msg1, msg2);
@@ -3094,8 +3273,8 @@ fn test_create_session_message_includes_session_data() {
     let authority = [0x42u8; 32];
     let programs1 = vec![[0xAAu8; 32]];
     let programs2 = vec![[0xBBu8; 32]];
-    let hash1 = create_session::hash_session_data(&authority, 500, 0, 1, &programs1);
-    let hash2 = create_session::hash_session_data(&authority, 500, 0, 1, &programs2);
+    let hash1 = create_session::hash_session_data(&authority, 500, 0, 0, 1, &programs1);
+    let hash2 = create_session::hash_session_data(&authority, 500, 0, 0, 1, &programs2);
     assert_ne!(hash1, hash2);
     let msg1 = create_session::compute_create_session_message(&wallet, 100, 0, 200, &hash1);
     let msg2 = create_session::compute_create_session_message(&wallet, 100, 0, 200, &hash2);
@@ -3129,7 +3308,7 @@ fn test_session_domain_separation_from_execute() {
     let wallet = Pubkey::new_unique();
     let authority = [0x42u8; 32];
     let programs = vec![[0xAAu8; 32]];
-    let data_hash = create_session::hash_session_data(&authority, 500, 0, 1, &programs);
+    let data_hash = create_session::hash_session_data(&authority, 500, 0, 0, 1, &programs);
     let session_msg =
         create_session::compute_create_session_message(&wallet, 100, 0, 200, &data_hash);
     let execute_msg = execute::compute_message_hash(&wallet, 100, 0, 200, &data_hash);
@@ -3143,7 +3322,7 @@ fn test_revoke_session_domain_separation() {
     let revoke_msg =
         revoke_session::compute_revoke_session_message(&wallet, 100, 0, 200, &authority);
     let programs = vec![[0xAAu8; 32]];
-    let data_hash = create_session::hash_session_data(&authority, 500, 0, 1, &programs);
+    let data_hash = create_session::hash_session_data(&authority, 500, 0, 0, 1, &programs);
     let session_msg =
         create_session::compute_create_session_message(&wallet, 100, 0, 200, &data_hash);
     assert_ne!(revoke_msg, session_msg);
@@ -3163,11 +3342,13 @@ fn test_session_state_roundtrip_in_integration() {
         expiry_slot: 200,
         revoked: false,
         wallet_creation_slot: 50,
-        max_lamports_per_ix: 1_000_000_000,
+        max_lamports_per_call: 1_000_000_000,
+        max_total_spent_lamports: 0,
+        total_spent_lamports: 0,
         allowed_programs_count: 2,
         allowed_programs: programs,
     };
-    let mut buf = [0u8; SessionState::LEN];
+    let mut buf = vec![0u8; session.serialized_size()];
     session.serialize(&mut buf).unwrap();
     let decoded = SessionState::deserialize(&buf).unwrap();
     assert_eq!(session, decoded);
@@ -3218,6 +3399,62 @@ async fn test_add_authority_duplicate_rejected() {
     );
     let result = banks.process_transaction(tx).await;
     assert!(result.is_err(), "Duplicate authority should be rejected (DuplicateAuthority)");
+}
+
+/// The same P-256 pubkey must NOT be addable twice under different sig_schemes
+/// (SECP256R1 and WEBAUTHN). Allowing this would let one hardware key claim two
+/// independent threshold votes, silently collapsing a 2-of-N wallet into 1-of-N.
+#[tokio::test]
+async fn test_add_authority_rejects_cross_scheme_pubkey_reuse() {
+    let (mut banks, payer, recent_blockhash) = program_test().start().await;
+    // Wallet created with P-256 key registered as SECP256R1.
+    let (signing_key, compressed) = generate_p256_keypair();
+    let (create_ix, wallet_pda, _) = build_create_wallet_ix_with_scheme(
+        &payer.pubkey(),
+        machine_wallet::state::SIG_SCHEME_SECP256R1,
+        &compressed,
+    );
+    let tx = Transaction::new_signed_with_payer(
+        &[create_ix],
+        Some(&payer.pubkey()),
+        &[&payer],
+        recent_blockhash,
+    );
+    banks.process_transaction(tx).await.unwrap();
+
+    // Attempt to add the same raw pubkey as WEBAUTHN scheme — must be rejected.
+    let wallet = read_wallet_state(&mut banks, &wallet_pda).await;
+    let msg = compute_add_authority_message(
+        &wallet_pda,
+        wallet.creation_slot,
+        wallet.nonce,
+        u64::MAX,
+        machine_wallet::state::SIG_SCHEME_WEBAUTHN,
+        &compressed,
+        0,
+    );
+    let tx = Transaction::new_signed_with_payer(
+        &[
+            build_secp256r1_ix(&signing_key, &compressed, &msg),
+            build_add_authority_ix(
+                &payer.pubkey(),
+                &wallet_pda,
+                0,
+                machine_wallet::state::SIG_SCHEME_WEBAUTHN,
+                &compressed,
+                0,
+                u64::MAX,
+            ),
+        ],
+        Some(&payer.pubkey()),
+        &[&payer],
+        banks.get_latest_blockhash().await.unwrap(),
+    );
+    let result = banks.process_transaction(tx).await;
+    assert!(
+        result.is_err(),
+        "Same P-256 pubkey reused under different sig_scheme must be rejected"
+    );
 }
 
 /// Removing the last authority must fail.
@@ -3999,7 +4236,7 @@ async fn test_create_session_rejects_zero_allowed_programs() {
 
     // Build instruction data manually with 0 allowed programs
     let session_data_hash = create_session::hash_session_data(
-        &session_authority.pubkey().to_bytes(), wallet.creation_slot + 500, 0, 0, &[],
+        &session_authority.pubkey().to_bytes(), wallet.creation_slot + 500, 0, 0, 0, &[],
     );
     let expected_message = create_session::compute_create_session_message(
         &wallet_pda, wallet.creation_slot, wallet.nonce, u64::MAX, &session_data_hash,
@@ -4007,7 +4244,7 @@ async fn test_create_session_rejects_zero_allowed_programs() {
 
     let create_session_ix = build_create_session_ix(
         &payer.pubkey(), &wallet_pda, &session_pda, 0, u64::MAX,
-        &session_authority.pubkey(), wallet.creation_slot + 500, 0, &[],
+        &session_authority.pubkey(), wallet.creation_slot + 500, 0, 0, &[],
     );
 
     let tx = Transaction::new_signed_with_payer(
@@ -4037,7 +4274,7 @@ async fn test_create_session_rejects_past_expiry() {
     let allowed_bytes: Vec<[u8; 32]> = allowed.iter().map(|p| p.to_bytes()).collect();
     // expiry_slot = 1, which is in the past
     let session_data_hash = create_session::hash_session_data(
-        &session_authority.pubkey().to_bytes(), 1, 0, 1, &allowed_bytes,
+        &session_authority.pubkey().to_bytes(), 1, 0, 0, 1, &allowed_bytes,
     );
     let expected_message = create_session::compute_create_session_message(
         &wallet_pda, wallet.creation_slot, wallet.nonce, u64::MAX, &session_data_hash,
@@ -4045,7 +4282,7 @@ async fn test_create_session_rejects_past_expiry() {
 
     let create_session_ix = build_create_session_ix(
         &payer.pubkey(), &wallet_pda, &session_pda, 0, u64::MAX,
-        &session_authority.pubkey(), 1, 0, &allowed,
+        &session_authority.pubkey(), 1, 0, 0, &allowed,
     );
 
     let tx = Transaction::new_signed_with_payer(
@@ -4124,4 +4361,783 @@ async fn test_create_wallet_truncated_authority_rejected() {
     );
     let result = banks.process_transaction(tx).await;
     assert!(result.is_err(), "Truncated authority should fail");
+}
+
+// ===========================================================================
+// WebAuthn (Passkey) Integration Tests
+//
+// Tests that short-circuit before precompile verification (UV/UP/type
+// checks, empty-precompile threshold enforcement) run unconditionally.
+// Tests that need a real secp256r1 precompile verification are marked
+// `#[ignore]` following the same convention as the Execute tests.
+// ===========================================================================
+
+fn passkey_base64url_no_pad(data: &[u8; 32]) -> String {
+    const TABLE: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = Vec::with_capacity(43);
+    let mut i = 0;
+    while i + 2 < data.len() {
+        let b0 = data[i] as usize;
+        let b1 = data[i + 1] as usize;
+        let b2 = data[i + 2] as usize;
+        out.push(TABLE[(b0 >> 2) & 0x3F]);
+        out.push(TABLE[((b0 << 4) | (b1 >> 4)) & 0x3F]);
+        out.push(TABLE[((b1 << 2) | (b2 >> 6)) & 0x3F]);
+        out.push(TABLE[b2 & 0x3F]);
+        i += 3;
+    }
+    let b0 = data[i] as usize;
+    let b1 = data[i + 1] as usize;
+    out.push(TABLE[(b0 >> 2) & 0x3F]);
+    out.push(TABLE[((b0 << 4) | (b1 >> 4)) & 0x3F]);
+    out.push(TABLE[(b1 << 2) & 0x3F]);
+    String::from_utf8(out).unwrap()
+}
+
+/// 37-byte authenticatorData: 32-byte rpIdHash + flags + 4-byte signCount.
+/// Flags byte is exposed so tests can omit UP or UV to exercise error paths.
+/// rpIdHash is the SHA-256 of `EXPECTED_RP_ID` ("soulpass.ai").
+fn passkey_auth_data(flags: u8) -> Vec<u8> {
+    let mut data = vec![0xAAu8; 37];
+    data[..32].copy_from_slice(&machine_wallet::webauthn::EXPECTED_RP_ID_HASH);
+    data[32] = flags;
+    data
+}
+
+fn passkey_client_data_json(challenge: &[u8; 32]) -> String {
+    format!(
+        r#"{{"type":"webauthn.get","challenge":"{}","origin":"https://soulpass.ai","crossOrigin":false}}"#,
+        passkey_base64url_no_pad(challenge)
+    )
+}
+
+/// WebAuthn signed message = authenticatorData || SHA256(clientDataJSON).
+fn passkey_signed_message(auth_data: &[u8], client_data_json: &[u8]) -> Vec<u8> {
+    let cdj_hash = solana_sdk::hash::hash(client_data_json).to_bytes();
+    let mut msg = Vec::with_capacity(auth_data.len() + 32);
+    msg.extend_from_slice(auth_data);
+    msg.extend_from_slice(&cdj_hash);
+    msg
+}
+
+/// Secp256r1 precompile carrying a variable-length signed message (WebAuthn).
+fn build_secp256r1_ix_variable(
+    signing_key: &SigningKey,
+    compressed_pubkey: &[u8; 33],
+    message: &[u8],
+) -> Instruction {
+    let sig: p256::ecdsa::Signature = signing_key.sign(message);
+    let sig_bytes: [u8; 64] = sig.to_bytes().into();
+
+    let sig_offset: u16 = 16;
+    let pk_offset: u16 = 80;
+    let msg_offset: u16 = 113;
+
+    let mut data = Vec::with_capacity(2 + 14 + 64 + 33 + message.len());
+    data.push(1u8);
+    data.push(0u8);
+
+    data.extend_from_slice(&sig_offset.to_le_bytes());
+    data.extend_from_slice(&0xFFFFu16.to_le_bytes());
+    data.extend_from_slice(&pk_offset.to_le_bytes());
+    data.extend_from_slice(&0xFFFFu16.to_le_bytes());
+    data.extend_from_slice(&msg_offset.to_le_bytes());
+    data.extend_from_slice(&(message.len() as u16).to_le_bytes());
+    data.extend_from_slice(&0xFFFFu16.to_le_bytes());
+
+    data.extend_from_slice(&sig_bytes);
+    data.extend_from_slice(compressed_pubkey);
+    data.extend_from_slice(message);
+
+    Instruction {
+        program_id: SECP256R1_PROGRAM_ID,
+        accounts: vec![],
+        data,
+    }
+}
+
+/// Build a `ProvideWebAuthnEvidence` sidecar instruction (discriminator 14).
+/// Place one per passkey contribution in the tx — each paired with a separate
+/// secp256r1 precompile signing `auth_data ‖ SHA256(cd)`.
+fn build_provide_webauthn_evidence_ix(
+    auth_data: &[u8],
+    client_data_json: &[u8],
+) -> Instruction {
+    let mut data = vec![14u8];
+    data.extend_from_slice(&(auth_data.len() as u16).to_le_bytes());
+    data.extend_from_slice(auth_data);
+    data.extend_from_slice(&(client_data_json.len() as u16).to_le_bytes());
+    data.extend_from_slice(client_data_json);
+    Instruction {
+        program_id: machine_wallet::id(),
+        accounts: vec![],
+        data,
+    }
+}
+
+/// Create a v1 wallet whose sole authority is a WEBAUTHN (P-256) key.
+async fn create_webauthn_wallet_helper(
+    banks: &mut BanksClient,
+    payer: &Keypair,
+    recent_blockhash: solana_sdk::hash::Hash,
+) -> (Pubkey, Pubkey, SigningKey, [u8; 33]) {
+    let (signing_key, compressed) = generate_p256_keypair();
+    let (create_ix, wallet_pda, vault_pda) = build_create_wallet_ix_with_scheme(
+        &payer.pubkey(),
+        machine_wallet::state::SIG_SCHEME_WEBAUTHN,
+        &compressed,
+    );
+    let tx = Transaction::new_signed_with_payer(
+        &[create_ix],
+        Some(&payer.pubkey()),
+        &[payer],
+        recent_blockhash,
+    );
+    banks.process_transaction(tx).await.unwrap();
+    (wallet_pda, vault_pda, signing_key, compressed)
+}
+
+/// UP=1 + UV=1 flag byte — the only combination `build_webauthn_message` accepts.
+const PASSKEY_FLAGS_UP_UV: u8 = 0x05;
+
+fn contains_custom_err(err: &dyn std::fmt::Debug, code: u32) -> bool {
+    format!("{:?}", err).contains(&format!("Custom({})", code))
+}
+
+// --- tests that do NOT require secp256r1 precompile support -----------------
+
+/// Threshold enforcement: an Execute carrying a ProvideWebAuthnEvidence sidecar
+/// but no matching secp256r1 precompile must fail — the sidecar alone provides
+/// zero authority contribution; it is only the pairing with a precompile that
+/// counts toward the threshold.
+#[tokio::test]
+async fn test_execute_webauthn_no_precompile_rejected() {
+    let (mut banks, payer, recent_blockhash) = program_test().start().await;
+    let (wallet_pda, vault_pda, _sk, _pk) =
+        create_webauthn_wallet_helper(&mut banks, &payer, recent_blockhash).await;
+
+    let wallet_state = read_wallet_state(&mut banks, &wallet_pda).await;
+    let recipient = Pubkey::new_unique();
+    let inner = make_inner(
+        system_program::id().to_bytes(),
+        &[
+            (0, AccountEntry::FLAG_WRITABLE),
+            (1, AccountEntry::FLAG_WRITABLE),
+        ],
+        system_instruction::transfer(&vault_pda, &recipient, 1).data.clone(),
+    );
+    let inner_hash = hash_inner(
+        &[inner.clone()],
+        &[vault_pda, recipient, system_program::id()],
+    );
+    let execute_hash = compute_message_hash(
+        &wallet_pda,
+        wallet_state.creation_slot,
+        0,
+        u64::MAX,
+        &inner_hash,
+    );
+    let auth_data = passkey_auth_data(PASSKEY_FLAGS_UP_UV);
+    let client_data = passkey_client_data_json(&execute_hash);
+
+    // Sidecar present but no matching secp256r1 precompile → WEBAUTHN authority
+    // contributes 0, threshold missed.
+    let sidecar_ix = build_provide_webauthn_evidence_ix(&auth_data, client_data.as_bytes());
+    let exec_ix = build_execute_ix(
+        &payer.pubkey(),
+        &wallet_pda,
+        &vault_pda,
+        0, // secp256r1_ix_index — v1 wallet ignores this
+        u64::MAX,
+        &[inner],
+        &[
+            AccountMeta::new(vault_pda, false),
+            AccountMeta::new(recipient, false),
+            AccountMeta::new_readonly(system_program::id(), false),
+        ],
+    );
+    let err = banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[sidecar_ix, exec_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            banks.get_latest_blockhash().await.unwrap(),
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        contains_custom_err(
+            &err,
+            machine_wallet::error::MachineWalletError::InsufficientSignatures as u32
+        ),
+        "expected InsufficientSignatures, got {:?}",
+        err
+    );
+}
+
+/// UV bit clear → rejected before any precompile verification.
+#[tokio::test]
+async fn test_execute_webauthn_rejects_uv_clear() {
+    let (mut banks, payer, recent_blockhash) = program_test().start().await;
+    let (wallet_pda, vault_pda, _sk, _pk) =
+        create_webauthn_wallet_helper(&mut banks, &payer, recent_blockhash).await;
+    let wallet_state = read_wallet_state(&mut banks, &wallet_pda).await;
+    let recipient = Pubkey::new_unique();
+    let inner = make_inner(
+        system_program::id().to_bytes(),
+        &[
+            (0, AccountEntry::FLAG_WRITABLE),
+            (1, AccountEntry::FLAG_WRITABLE),
+        ],
+        system_instruction::transfer(&vault_pda, &recipient, 1).data.clone(),
+    );
+    let inner_hash = hash_inner(
+        &[inner.clone()],
+        &[vault_pda, recipient, system_program::id()],
+    );
+    let execute_hash = compute_message_hash(
+        &wallet_pda,
+        wallet_state.creation_slot,
+        0,
+        u64::MAX,
+        &inner_hash,
+    );
+    // UP=1, UV=0 → rejected.
+    let auth_data = passkey_auth_data(0x01);
+    let client_data = passkey_client_data_json(&execute_hash);
+
+    let sidecar_ix = build_provide_webauthn_evidence_ix(&auth_data, client_data.as_bytes());
+    let exec_ix = build_execute_ix(
+        &payer.pubkey(),
+        &wallet_pda,
+        &vault_pda,
+        0, // secp256r1_ix_index — ignored for v1 wallets
+        u64::MAX,
+        &[inner],
+        &[
+            AccountMeta::new(vault_pda, false),
+            AccountMeta::new(recipient, false),
+            AccountMeta::new_readonly(system_program::id(), false),
+        ],
+    );
+    let err = banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[sidecar_ix, exec_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            banks.get_latest_blockhash().await.unwrap(),
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        contains_custom_err(
+            &err,
+            machine_wallet::error::MachineWalletError::WebAuthnUserNotVerified as u32
+        ),
+        "expected WebAuthnUserNotVerified, got {:?}",
+        err
+    );
+}
+
+/// clientDataJSON.type != "webauthn.get" → WebAuthnInvalidType.
+#[tokio::test]
+async fn test_execute_webauthn_rejects_wrong_type() {
+    let (mut banks, payer, recent_blockhash) = program_test().start().await;
+    let (wallet_pda, vault_pda, _sk, _pk) =
+        create_webauthn_wallet_helper(&mut banks, &payer, recent_blockhash).await;
+    let wallet_state = read_wallet_state(&mut banks, &wallet_pda).await;
+    let recipient = Pubkey::new_unique();
+    let inner = make_inner(
+        system_program::id().to_bytes(),
+        &[
+            (0, AccountEntry::FLAG_WRITABLE),
+            (1, AccountEntry::FLAG_WRITABLE),
+        ],
+        system_instruction::transfer(&vault_pda, &recipient, 1).data.clone(),
+    );
+    let inner_hash = hash_inner(
+        &[inner.clone()],
+        &[vault_pda, recipient, system_program::id()],
+    );
+    let execute_hash = compute_message_hash(
+        &wallet_pda,
+        wallet_state.creation_slot,
+        0,
+        u64::MAX,
+        &inner_hash,
+    );
+    let auth_data = passkey_auth_data(PASSKEY_FLAGS_UP_UV);
+    let cdj = format!(
+        r#"{{"type":"webauthn.create","challenge":"{}"}}"#,
+        passkey_base64url_no_pad(&execute_hash)
+    );
+
+    let sidecar_ix = build_provide_webauthn_evidence_ix(&auth_data, cdj.as_bytes());
+    let exec_ix = build_execute_ix(
+        &payer.pubkey(),
+        &wallet_pda,
+        &vault_pda,
+        0, // secp256r1_ix_index — ignored for v1 wallets
+        u64::MAX,
+        &[inner],
+        &[
+            AccountMeta::new(vault_pda, false),
+            AccountMeta::new(recipient, false),
+            AccountMeta::new_readonly(system_program::id(), false),
+        ],
+    );
+    let err = banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[sidecar_ix, exec_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            banks.get_latest_blockhash().await.unwrap(),
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        contains_custom_err(
+            &err,
+            machine_wallet::error::MachineWalletError::WebAuthnInvalidType as u32
+        ),
+        "expected WebAuthnInvalidType, got {:?}",
+        err
+    );
+}
+
+// --- tests that DO require secp256r1 precompile support ---------------------
+
+/// Happy path: single WEBAUTHN authority, threshold=1, valid passkey signature.
+#[tokio::test]
+#[ignore = "requires secp256r1 precompile support in test validator"]
+async fn test_execute_webauthn_happy_path() {
+    let (mut banks, payer, recent_blockhash) = program_test().start().await;
+    let (wallet_pda, vault_pda, signing_key, compressed) =
+        create_webauthn_wallet_helper(&mut banks, &payer, recent_blockhash).await;
+
+    banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[system_instruction::transfer(
+                &payer.pubkey(),
+                &vault_pda,
+                1_000_000_000,
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            banks.get_latest_blockhash().await.unwrap(),
+        ))
+        .await
+        .unwrap();
+
+    let wallet_state = read_wallet_state(&mut banks, &wallet_pda).await;
+    let recipient = Pubkey::new_unique();
+    let transfer_amount: u64 = 500_000_000;
+    let inner = make_inner(
+        system_program::id().to_bytes(),
+        &[
+            (0, AccountEntry::FLAG_WRITABLE),
+            (1, AccountEntry::FLAG_WRITABLE),
+        ],
+        system_instruction::transfer(&vault_pda, &recipient, transfer_amount)
+            .data
+            .clone(),
+    );
+    let inner_hash = hash_inner(
+        &[inner.clone()],
+        &[vault_pda, recipient, system_program::id()],
+    );
+    let execute_hash = compute_message_hash(
+        &wallet_pda,
+        wallet_state.creation_slot,
+        0,
+        u64::MAX,
+        &inner_hash,
+    );
+    let auth_data = passkey_auth_data(PASSKEY_FLAGS_UP_UV);
+    let client_data = passkey_client_data_json(&execute_hash);
+    let wa_msg = passkey_signed_message(&auth_data, client_data.as_bytes());
+    let precompile_ix = build_secp256r1_ix_variable(&signing_key, &compressed, &wa_msg);
+
+    let sidecar_ix = build_provide_webauthn_evidence_ix(&auth_data, client_data.as_bytes());
+    let exec_ix = build_execute_ix(
+        &payer.pubkey(),
+        &wallet_pda,
+        &vault_pda,
+        0, // secp256r1_ix_index — ignored for v1 wallets
+        u64::MAX,
+        &[inner],
+        &[
+            AccountMeta::new(vault_pda, false),
+            AccountMeta::new(recipient, false),
+            AccountMeta::new_readonly(system_program::id(), false),
+        ],
+    );
+
+    banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[precompile_ix, sidecar_ix, exec_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            banks.get_latest_blockhash().await.unwrap(),
+        ))
+        .await
+        .unwrap();
+
+    let recipient_account = banks.get_account(recipient).await.unwrap().unwrap();
+    assert_eq!(recipient_account.lamports, transfer_amount);
+    let wallet_after = read_wallet_state(&mut banks, &wallet_pda).await;
+    assert_eq!(wallet_after.nonce, 1);
+}
+
+/// Threshold-bypass regression: threshold=2 + single passkey signature → reject.
+#[tokio::test]
+#[ignore = "requires secp256r1 precompile support in test validator"]
+async fn test_execute_webauthn_threshold_bypass_rejected() {
+    use machine_wallet::processor::set_threshold::compute_set_threshold_message;
+
+    let (mut banks, payer, recent_blockhash) = program_test().start().await;
+    let owner = Keypair::new();
+    let owner_bytes = ed25519_authority_bytes(&owner);
+    let (create_ix, wallet_pda, vault_pda) =
+        build_create_wallet_ix_with_scheme(&payer.pubkey(), 1, &owner_bytes);
+    banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[create_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            recent_blockhash,
+        ))
+        .await
+        .unwrap();
+
+    let wallet = read_wallet_state(&mut banks, &wallet_pda).await;
+    let (wa_signing_key, wa_pubkey) = generate_p256_keypair();
+    let add_msg = compute_add_authority_message(
+        &wallet_pda,
+        wallet.creation_slot,
+        wallet.nonce,
+        u64::MAX,
+        machine_wallet::state::SIG_SCHEME_WEBAUTHN,
+        &wa_pubkey,
+        0,
+    );
+    banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[
+                build_ed25519_precompile_ix(&owner, &add_msg),
+                build_add_authority_ix(
+                    &payer.pubkey(),
+                    &wallet_pda,
+                    0,
+                    machine_wallet::state::SIG_SCHEME_WEBAUTHN,
+                    &wa_pubkey,
+                    0,
+                    u64::MAX,
+                ),
+            ],
+            Some(&payer.pubkey()),
+            &[&payer],
+            banks.get_latest_blockhash().await.unwrap(),
+        ))
+        .await
+        .unwrap();
+
+    let wallet = read_wallet_state(&mut banks, &wallet_pda).await;
+    let set_msg = compute_set_threshold_message(
+        &wallet_pda,
+        wallet.creation_slot,
+        wallet.nonce,
+        u64::MAX,
+        2,
+    );
+    banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[
+                build_ed25519_precompile_ix(&owner, &set_msg),
+                build_set_threshold_ix(&payer.pubkey(), &wallet_pda, 0, 2, u64::MAX),
+            ],
+            Some(&payer.pubkey()),
+            &[&payer],
+            banks.get_latest_blockhash().await.unwrap(),
+        ))
+        .await
+        .unwrap();
+
+    let wallet = read_wallet_state(&mut banks, &wallet_pda).await;
+    let recipient = Pubkey::new_unique();
+    let inner = make_inner(
+        system_program::id().to_bytes(),
+        &[
+            (0, AccountEntry::FLAG_WRITABLE),
+            (1, AccountEntry::FLAG_WRITABLE),
+        ],
+        system_instruction::transfer(&vault_pda, &recipient, 1).data.clone(),
+    );
+    let inner_hash = hash_inner(
+        &[inner.clone()],
+        &[vault_pda, recipient, system_program::id()],
+    );
+    let execute_hash = compute_message_hash(
+        &wallet_pda,
+        wallet.creation_slot,
+        wallet.nonce,
+        u64::MAX,
+        &inner_hash,
+    );
+    let auth_data = passkey_auth_data(PASSKEY_FLAGS_UP_UV);
+    let client_data = passkey_client_data_json(&execute_hash);
+    let wa_msg = passkey_signed_message(&auth_data, client_data.as_bytes());
+    let precompile_ix = build_secp256r1_ix_variable(&wa_signing_key, &wa_pubkey, &wa_msg);
+
+    let sidecar_ix = build_provide_webauthn_evidence_ix(&auth_data, client_data.as_bytes());
+    let exec_ix = build_execute_ix(
+        &payer.pubkey(),
+        &wallet_pda,
+        &vault_pda,
+        0, // secp256r1_ix_index — ignored for v1 wallets
+        u64::MAX,
+        &[inner],
+        &[
+            AccountMeta::new(vault_pda, false),
+            AccountMeta::new(recipient, false),
+            AccountMeta::new_readonly(system_program::id(), false),
+        ],
+    );
+    let err = banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[precompile_ix, sidecar_ix, exec_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            banks.get_latest_blockhash().await.unwrap(),
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        contains_custom_err(
+            &err,
+            machine_wallet::error::MachineWalletError::InsufficientSignatures as u32
+        ),
+        "expected InsufficientSignatures, got {:?}",
+        err
+    );
+}
+
+/// Mixed-scheme threshold=2: one Ed25519 + one WebAuthn precompile → success.
+#[tokio::test]
+#[ignore = "requires secp256r1 precompile support in test validator"]
+async fn test_execute_webauthn_mixed_sig_threshold_met() {
+    use machine_wallet::processor::set_threshold::compute_set_threshold_message;
+
+    let (mut banks, payer, recent_blockhash) = program_test().start().await;
+    let owner = Keypair::new();
+    let owner_bytes = ed25519_authority_bytes(&owner);
+    let (create_ix, wallet_pda, vault_pda) =
+        build_create_wallet_ix_with_scheme(&payer.pubkey(), 1, &owner_bytes);
+    banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[create_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            recent_blockhash,
+        ))
+        .await
+        .unwrap();
+
+    banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[system_instruction::transfer(
+                &payer.pubkey(),
+                &vault_pda,
+                1_000_000_000,
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            banks.get_latest_blockhash().await.unwrap(),
+        ))
+        .await
+        .unwrap();
+
+    let wallet = read_wallet_state(&mut banks, &wallet_pda).await;
+    let (wa_signing_key, wa_pubkey) = generate_p256_keypair();
+    let add_msg = compute_add_authority_message(
+        &wallet_pda,
+        wallet.creation_slot,
+        wallet.nonce,
+        u64::MAX,
+        machine_wallet::state::SIG_SCHEME_WEBAUTHN,
+        &wa_pubkey,
+        0,
+    );
+    banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[
+                build_ed25519_precompile_ix(&owner, &add_msg),
+                build_add_authority_ix(
+                    &payer.pubkey(),
+                    &wallet_pda,
+                    0,
+                    machine_wallet::state::SIG_SCHEME_WEBAUTHN,
+                    &wa_pubkey,
+                    0,
+                    u64::MAX,
+                ),
+            ],
+            Some(&payer.pubkey()),
+            &[&payer],
+            banks.get_latest_blockhash().await.unwrap(),
+        ))
+        .await
+        .unwrap();
+
+    let wallet = read_wallet_state(&mut banks, &wallet_pda).await;
+    let set_msg = compute_set_threshold_message(
+        &wallet_pda,
+        wallet.creation_slot,
+        wallet.nonce,
+        u64::MAX,
+        2,
+    );
+    banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[
+                build_ed25519_precompile_ix(&owner, &set_msg),
+                build_set_threshold_ix(&payer.pubkey(), &wallet_pda, 0, 2, u64::MAX),
+            ],
+            Some(&payer.pubkey()),
+            &[&payer],
+            banks.get_latest_blockhash().await.unwrap(),
+        ))
+        .await
+        .unwrap();
+
+    let wallet = read_wallet_state(&mut banks, &wallet_pda).await;
+    let recipient = Pubkey::new_unique();
+    let transfer_amount: u64 = 250_000_000;
+    let inner = make_inner(
+        system_program::id().to_bytes(),
+        &[
+            (0, AccountEntry::FLAG_WRITABLE),
+            (1, AccountEntry::FLAG_WRITABLE),
+        ],
+        system_instruction::transfer(&vault_pda, &recipient, transfer_amount)
+            .data
+            .clone(),
+    );
+    let inner_hash = hash_inner(
+        &[inner.clone()],
+        &[vault_pda, recipient, system_program::id()],
+    );
+    let execute_hash = compute_message_hash(
+        &wallet_pda,
+        wallet.creation_slot,
+        wallet.nonce,
+        u64::MAX,
+        &inner_hash,
+    );
+    let auth_data = passkey_auth_data(PASSKEY_FLAGS_UP_UV);
+    let client_data = passkey_client_data_json(&execute_hash);
+    let wa_msg = passkey_signed_message(&auth_data, client_data.as_bytes());
+
+    let ed_precompile = build_ed25519_precompile_ix(&owner, &execute_hash);
+    let wa_precompile = build_secp256r1_ix_variable(&wa_signing_key, &wa_pubkey, &wa_msg);
+
+    let sidecar_ix = build_provide_webauthn_evidence_ix(&auth_data, client_data.as_bytes());
+    let exec_ix = build_execute_ix(
+        &payer.pubkey(),
+        &wallet_pda,
+        &vault_pda,
+        0, // secp256r1_ix_index — ignored for v1 wallets
+        u64::MAX,
+        &[inner],
+        &[
+            AccountMeta::new(vault_pda, false),
+            AccountMeta::new(recipient, false),
+            AccountMeta::new_readonly(system_program::id(), false),
+        ],
+    );
+
+    banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[ed_precompile, wa_precompile, sidecar_ix, exec_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            banks.get_latest_blockhash().await.unwrap(),
+        ))
+        .await
+        .unwrap();
+
+    let recipient_account = banks.get_account(recipient).await.unwrap().unwrap();
+    assert_eq!(recipient_account.lamports, transfer_amount);
+    let wallet_after = read_wallet_state(&mut banks, &wallet_pda).await;
+    assert_eq!(wallet_after.nonce, wallet.nonce + 1);
+}
+
+/// Expired max_slot → SignatureExpired.
+#[tokio::test]
+#[ignore = "requires secp256r1 precompile support in test validator"]
+async fn test_execute_webauthn_expired_max_slot() {
+    let (mut banks, payer, recent_blockhash) = program_test().start().await;
+    let (wallet_pda, vault_pda, signing_key, compressed) =
+        create_webauthn_wallet_helper(&mut banks, &payer, recent_blockhash).await;
+
+    let wallet_state = read_wallet_state(&mut banks, &wallet_pda).await;
+    let recipient = Pubkey::new_unique();
+    let inner = make_inner(
+        system_program::id().to_bytes(),
+        &[
+            (0, AccountEntry::FLAG_WRITABLE),
+            (1, AccountEntry::FLAG_WRITABLE),
+        ],
+        system_instruction::transfer(&vault_pda, &recipient, 1).data.clone(),
+    );
+    let inner_hash = hash_inner(
+        &[inner.clone()],
+        &[vault_pda, recipient, system_program::id()],
+    );
+    // max_slot=0 is already past by the time CreateWallet is confirmed.
+    let expired: u64 = 0;
+    let execute_hash = compute_message_hash(
+        &wallet_pda,
+        wallet_state.creation_slot,
+        0,
+        expired,
+        &inner_hash,
+    );
+    let auth_data = passkey_auth_data(PASSKEY_FLAGS_UP_UV);
+    let client_data = passkey_client_data_json(&execute_hash);
+    let wa_msg = passkey_signed_message(&auth_data, client_data.as_bytes());
+    let precompile_ix = build_secp256r1_ix_variable(&signing_key, &compressed, &wa_msg);
+
+    let sidecar_ix = build_provide_webauthn_evidence_ix(&auth_data, client_data.as_bytes());
+    let exec_ix = build_execute_ix(
+        &payer.pubkey(),
+        &wallet_pda,
+        &vault_pda,
+        0, // secp256r1_ix_index — ignored for v1 wallets
+        expired,
+        &[inner],
+        &[
+            AccountMeta::new(vault_pda, false),
+            AccountMeta::new(recipient, false),
+            AccountMeta::new_readonly(system_program::id(), false),
+        ],
+    );
+    let err = banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[precompile_ix, sidecar_ix, exec_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            banks.get_latest_blockhash().await.unwrap(),
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        contains_custom_err(
+            &err,
+            machine_wallet::error::MachineWalletError::SignatureExpired as u32
+        ),
+        "expected SignatureExpired, got {:?}",
+        err
+    );
 }

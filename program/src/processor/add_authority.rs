@@ -51,6 +51,7 @@ pub fn compute_add_authority_message(
     .to_bytes()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn process(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -130,12 +131,16 @@ pub fn process(
         };
     }
 
-    // 6c. No duplicate: (sig_scheme, pubkey) must not already exist
+    // 6c. No duplicate: raw pubkey bytes must not already exist, regardless of
+    //     sig_scheme. Cross-scheme collision is the critical case: the same
+    //     33-byte compressed P-256 key registered under both SECP256R1 and
+    //     WEBAUTHN would grant one physical hardware key two independent votes
+    //     toward threshold, silently collapsing a 2-of-3 wallet into 1-of-2.
+    //     Ed25519 keys use the same 33-byte slot (32 + 0x00 pad), so comparing
+    //     full pubkey bytes covers all schemes without ambiguity.
     let count = wallet.authority_count as usize;
     for i in 0..count {
-        if wallet.authorities[i].sig_scheme == new_sig_scheme
-            && wallet.authorities[i].pubkey == new_pubkey
-        {
+        if wallet.authorities[i].pubkey == new_pubkey {
             return Err(MachineWalletError::DuplicateAuthority.into());
         }
     }
@@ -160,9 +165,10 @@ pub fn process(
         new_threshold,
     );
 
-    // 8. Signature verification (v0: single precompile at index, v1: threshold scan)
+    // 8. Signature verification.
     threshold::verify_wallet_signatures(
         instructions_sysvar,
+        program_id,
         &wallet,
         precompile_ix_index,
         &expected_message,

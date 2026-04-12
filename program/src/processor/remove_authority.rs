@@ -45,6 +45,7 @@ pub fn compute_remove_authority_message(
     .to_bytes()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn process(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -148,11 +149,11 @@ pub fn process(
         new_threshold,
     );
 
-    // 8. Signature verification (v0: single precompile at index, v1: threshold scan)
-    // Note: v0 wallets cannot reach here (blocked by 6a), but we use the
-    // unified path for consistency and future-proofing.
+    // 8. Signature verification. v0 wallets cannot reach here (blocked by 6a),
+    //    but we use the unified path for consistency and future-proofing.
     threshold::verify_wallet_signatures(
         instructions_sysvar,
+        program_id,
         &wallet,
         precompile_ix_index,
         &expected_message,
