@@ -86,9 +86,7 @@ pub fn process(
     if *system_program.key != SYSTEM_PROGRAM_ID {
         return Err(ProgramError::IncorrectProgramId);
     }
-    if *instructions_sysvar.key != solana_program::sysvar::instructions::ID {
-        return Err(ProgramError::InvalidAccountData);
-    }
+    super::require_instructions_sysvar(instructions_sysvar)?;
 
     // 3. Signature expiry
     let clock = Clock::get()?;
@@ -175,18 +173,20 @@ pub fn process(
     )?;
 
     // 9. State mutation
-    let new_nonce = wallet
-        .nonce
-        .checked_add(1)
-        .ok_or(MachineWalletError::InvalidNonce)?;
-
     if wallet.version == 0 {
         // ── v0 → v1 migration ──
+        // The wallet is loaded as v0, but we are constructing a fresh v1 buffer
+        // here, so `write_incremented_nonce` (which uses the wallet's own version)
+        // cannot be used; the nonce must be written at the v1 offset directly.
         // All v0 fields are already in `wallet` from deserialize_runtime above.
         // Defense-in-depth: v0 must have exactly 1 authority
         if wallet.authority_count != 1 {
             return Err(ProgramError::InvalidAccountData);
         }
+        let new_nonce = wallet
+            .nonce
+            .checked_add(1)
+            .ok_or(MachineWalletError::InvalidNonce)?;
 
         // Realloc to v1 size for 2 authorities
         let new_size = MachineWallet::v1_account_size(2);
@@ -244,9 +244,7 @@ pub fn process(
             data[34] = new_threshold;
         }
 
-        // Increment nonce (v1 offset)
-        data[MachineWallet::V1_NONCE_OFFSET..MachineWallet::V1_NONCE_OFFSET + 8]
-            .copy_from_slice(&new_nonce.to_le_bytes());
+        wallet.write_incremented_nonce(&mut data)?;
     }
 
     Ok(())

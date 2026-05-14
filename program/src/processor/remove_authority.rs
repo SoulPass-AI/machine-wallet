@@ -80,9 +80,7 @@ pub fn process(
     if *system_program.key != SYSTEM_PROGRAM_ID {
         return Err(ProgramError::IncorrectProgramId);
     }
-    if *instructions_sysvar.key != solana_program::sysvar::instructions::ID {
-        return Err(ProgramError::InvalidAccountData);
-    }
+    super::require_instructions_sysvar(instructions_sysvar)?;
 
     // 3. Signature expiry
     let clock = Clock::get()?;
@@ -160,11 +158,6 @@ pub fn process(
     )?;
 
     // 9. State mutation
-    let new_nonce = wallet
-        .nonce
-        .checked_add(1)
-        .ok_or(MachineWalletError::InvalidNonce)?;
-
     // Wallet must be v1 (v0 blocked by CannotRemoveLastAuthority above)
     // Swap-remove: copy last slot over the removed slot, then realloc shrink
     let new_size = MachineWallet::v1_account_size(new_count);
@@ -194,9 +187,7 @@ pub fn process(
             data[34] = new_threshold;
         }
 
-        // Increment nonce (v1 offset)
-        data[MachineWallet::V1_NONCE_OFFSET..MachineWallet::V1_NONCE_OFFSET + 8]
-            .copy_from_slice(&new_nonce.to_le_bytes());
+        wallet.write_incremented_nonce(&mut data)?;
     }
 
     // Resize account to shrink (drops the last authority slot)

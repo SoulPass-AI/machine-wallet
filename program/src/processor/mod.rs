@@ -14,9 +14,25 @@ pub mod self_revoke_session;
 pub mod session_execute;
 pub mod set_threshold;
 
-use solana_program::{account_info::AccountInfo, entrypoint::ProgramResult, pubkey::Pubkey};
+use solana_program::{
+    account_info::AccountInfo, entrypoint::ProgramResult, program_error::ProgramError,
+    pubkey::Pubkey,
+};
 
 use crate::instruction::MachineWalletInstruction;
+
+/// Reject any account that isn't the instructions sysvar.
+///
+/// Every state-mutating processor must read the sysvar to scan for the
+/// secp256r1/ed25519 precompile evidence — a wrong account here would silently
+/// disable signature checks, so a typo at any callsite must fail closed.
+#[inline(always)]
+pub(crate) fn require_instructions_sysvar(account: &AccountInfo) -> ProgramResult {
+    if *account.key != solana_program::sysvar::instructions::ID {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    Ok(())
+}
 
 pub fn process_instruction(
     program_id: &Pubkey,
@@ -27,9 +43,10 @@ pub fn process_instruction(
 
     match instruction {
         MachineWalletInstruction::CreateWallet {
+            max_slot,
             sig_scheme,
             authority,
-        } => create_wallet::process(program_id, accounts, sig_scheme, authority),
+        } => create_wallet::process(program_id, accounts, max_slot, sig_scheme, authority),
         MachineWalletInstruction::Execute {
             secp256r1_ix_index,
             max_slot,
@@ -152,11 +169,6 @@ pub fn process_instruction(
         MachineWalletInstruction::ProvideWebAuthnEvidence {
             auth_data,
             client_data_json,
-        } => provide_webauthn_evidence::process(
-            program_id,
-            accounts,
-            auth_data,
-            client_data_json,
-        ),
+        } => provide_webauthn_evidence::process(program_id, accounts, auth_data, client_data_json),
     }
 }

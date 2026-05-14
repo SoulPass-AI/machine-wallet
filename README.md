@@ -1,12 +1,12 @@
 # MachineWallet
 
-Solana smart wallet program with multi-sig threshold verification (Secp256r1 + Ed25519).
+Solana smart wallet program with multi-sig threshold verification (Secp256r1 + Ed25519 + WebAuthn).
 
 Hardware-secured key management for AI agents and autonomous systems.
 
 ## Overview
 
-MachineWallet is an on-chain program that enables hardware-backed wallets on Solana using P-256 (Secp256r1) signatures from secure enclaves (Apple SE, Android StrongBox, YubiKey). It supports multi-authority threshold signing and delegated session keys for high-frequency operations.
+MachineWallet is an on-chain program that enables hardware-backed wallets on Solana using P-256 (Secp256r1/WebAuthn) signatures from secure enclaves (Apple SE, Android StrongBox, YubiKey). It supports multi-authority threshold signing and delegated session keys for high-frequency operations.
 
 **Program ID:** `7VD7mx5bYgmSJY7D1etvADEdDXijdp3UMz79M53vTdMo`
 
@@ -28,7 +28,7 @@ The vault stays system-owned so `system_program::transfer` CPI works naturally. 
 
 | Instruction | Description |
 |-------------|-------------|
-| `CreateWallet` | Initialize wallet with P-256 or Ed25519 authority |
+| `CreateWallet` | Initialize wallet with Secp256r1, Ed25519, or WebAuthn authority proof |
 | `Execute` | Execute CPI calls, verified by threshold signatures |
 | `SessionExecute` | Execute CPI calls using a delegated session key |
 | `CreateSession` | Create a session key with expiry, spend cap, and program whitelist |
@@ -39,7 +39,7 @@ The vault stays system-owned so `system_program::transfer` CPI works naturally. 
 | `AddAuthority` | Add a new authority (P-256 or Ed25519) to the wallet |
 | `RemoveAuthority` | Remove an authority from the wallet |
 | `SetThreshold` | Change the signature threshold |
-| `CloseWallet` | Close wallet and vault, recover all funds |
+| `CloseWallet` | Recover vault SOL and excess wallet rent while keeping wallet state alive |
 | `AdvanceNonce` | Advance nonce to cancel a pending signed operation |
 
 ## Security Properties
@@ -51,16 +51,17 @@ The vault stays system-owned so `system_program::transfer` CPI works naturally. 
 - **Replay protection:** `nonce` (u64) + `creation_slot` (prevents replay after close+recreate)
 - **Domain separation:** Distinct `machine_wallet_*_v0` tags per instruction type
 - **Message binding:** `keccak256(domain_tag || wallet || creation_slot || nonce || max_slot || payload)`
+- **Create authorization:** Initial authority signs `machine_wallet_create_wallet_v0 || wallet_pda || max_slot || sig_scheme || authority`
 - **Account permission commitment:** `is_writable` flags included in signed inner instruction hash
 - **Session isolation:** Program whitelist, per-instruction lamport cap, expiry slot, `wallet_creation_slot` binding
-- **Authority validation:** P-256 compressed-point format check + Ed25519 validation at creation
+- **Authority validation:** Scheme-specific authority validation and proof at creation
 - **Threshold verification:** Bitmap dedup prevents double-counting; each authority counted at most once
 
 ## Quantum-Resistant Ready
 
 The multi-authority architecture is designed for post-quantum migration with zero wallet disruption:
 
-1. `sig_scheme` field in each `AuthoritySlot` supports arbitrary signature algorithms (currently `0 = Secp256r1`, `1 = Ed25519`)
+1. `sig_scheme` field in each `AuthoritySlot` supports arbitrary signature algorithms (currently `0 = Secp256r1`, `1 = Ed25519`, `2 = WebAuthn`)
 2. Adding a post-quantum authority (e.g., ML-DSA / Dilithium) is a single `AddAuthority` call — no wallet migration, no asset movement
 3. `wallet_id` is fixed at creation (keccak256 of initial authority) and never changes, so the wallet PDA address remains stable across authority and algorithm changes
 4. Threshold signing allows mixed algorithm sets (e.g., 2-of-3 with one P-256 + one Ed25519 + one ML-DSA), enabling gradual transition without downtime

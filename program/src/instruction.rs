@@ -22,9 +22,7 @@ pub const MAX_INNER_INSTRUCTIONS: usize = 64;
 /// the wrong size or empty; it only rejects for cryptographic / policy reasons
 /// (wrong rpIdHash, UP/UV cleared, challenge mismatch, etc.). Keeping these
 /// layers separate is first-principles defense-in-depth.
-pub(crate) fn parse_webauthn_evidence_payload(
-    data: &[u8],
-) -> Result<(&[u8], &[u8]), ProgramError> {
+pub(crate) fn parse_webauthn_evidence_payload(data: &[u8]) -> Result<(&[u8], &[u8]), ProgramError> {
     if data.len() < 4 {
         return Err(ProgramError::InvalidInstructionData);
     }
@@ -140,7 +138,7 @@ impl InnerInstructionRef<'_> {
 /// all valid contributions.
 ///
 /// Wire format:
-/// - CreateWallet:    [0] + authority (33 bytes) OR [0] + sig_scheme (u8) + authority (33 bytes)
+/// - CreateWallet:    [0] + max_slot (u64 LE) + sig_scheme (u8) + authority (33 bytes)
 /// - Execute:         [1] + secp256r1_ix_index (u8) + max_slot (u64 LE) + inner_instruction_count (u32 LE) + inner instructions
 /// - CloseWallet:     [2] + secp256r1_ix_index (u8) + max_slot (u64 LE) + destination (32 bytes)
 /// - AdvanceNonce:    [3] + secp256r1_ix_index (u8) + max_slot (u64 LE)
@@ -165,9 +163,13 @@ impl InnerInstructionRef<'_> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::large_enum_variant)] // Box would heap-allocate on SBF — unacceptable
 pub enum MachineWalletInstruction<'a> {
-    /// Initialize a new wallet with the given authority.
-    /// sig_scheme=0 means Secp256r1 (backward-compatible default).
-    CreateWallet { sig_scheme: u8, authority: [u8; 33] },
+    /// Initialize a new wallet with a scheme-specific authority proof.
+    /// sig_scheme=0 means Secp256r1.
+    CreateWallet {
+        max_slot: u64,
+        sig_scheme: u8,
+        authority: [u8; 33],
+    },
 
     /// Execute one or more inner instructions, verified by secp256r1 precompile.
     Execute {
@@ -353,28 +355,18 @@ impl<'a> MachineWalletInstruction<'a> {
         match discriminator {
             // CreateWallet
             0 => {
-                match rest.len() {
-                    33 => {
-                        // Old format: authority only, assume Secp256r1
-                        let mut authority = [0u8; 33];
-                        authority.copy_from_slice(rest);
-                        Ok(Self::CreateWallet {
-                            sig_scheme: 0,
-                            authority,
-                        }) // 0 = SIG_SCHEME_SECP256R1
-                    }
-                    34 => {
-                        // New format: sig_scheme + authority
-                        let sig_scheme = rest[0];
-                        let mut authority = [0u8; 33];
-                        authority.copy_from_slice(&rest[1..34]);
-                        Ok(Self::CreateWallet {
-                            sig_scheme,
-                            authority,
-                        })
-                    }
-                    _ => Err(ProgramError::InvalidInstructionData),
+                if rest.len() != 8 + 1 + 33 {
+                    return Err(ProgramError::InvalidInstructionData);
                 }
+                let max_slot = u64::from_le_bytes(rest[0..8].try_into().unwrap());
+                let sig_scheme = rest[8];
+                let mut authority = [0u8; 33];
+                authority.copy_from_slice(&rest[9..42]);
+                Ok(Self::CreateWallet {
+                    max_slot,
+                    sig_scheme,
+                    authority,
+                })
             }
 
             // Execute
@@ -437,8 +429,7 @@ impl<'a> MachineWalletInstruction<'a> {
                 session_authority.copy_from_slice(&rest[9..41]);
                 let expiry_slot = u64::from_le_bytes(rest[41..49].try_into().unwrap());
                 let max_lamports_per_call = u64::from_le_bytes(rest[49..57].try_into().unwrap());
-                let max_total_spent_lamports =
-                    u64::from_le_bytes(rest[57..65].try_into().unwrap());
+                let max_total_spent_lamports = u64::from_le_bytes(rest[57..65].try_into().unwrap());
                 let allowed_programs_count = rest[65];
 
                 // Reject zero (state deserialization also rejects it; keep both
@@ -614,6 +605,8 @@ mod tests {
     #[test]
     fn test_parse_create_wallet() {
         let mut data = vec![0u8]; // discriminator
+        data.extend_from_slice(&999u64.to_le_bytes());
+        data.push(0);
         let mut authority = [0xAAu8; 33];
         authority[0] = 0x02;
         data.extend_from_slice(&authority);
@@ -621,10 +614,12 @@ mod tests {
         let ix = MachineWalletInstruction::unpack(&data).unwrap();
         match ix {
             MachineWalletInstruction::CreateWallet {
+                max_slot,
                 sig_scheme,
                 authority: a,
             } => {
-                assert_eq!(sig_scheme, 0); // old format defaults to Secp256r1
+                assert_eq!(max_slot, 999);
+                assert_eq!(sig_scheme, 0);
                 assert_eq!(a[0], 0x02);
                 assert_eq!(a[1], 0xAA);
                 assert_eq!(a.len(), 33);
@@ -808,10 +803,12 @@ mod tests {
 
     #[test]
     fn test_create_wallet_rejects_trailing_bytes() {
-        // 35 bytes (neither 33 nor 34) — must be rejected
+        // CreateWallet must be exactly max_slot(8) + sig_scheme(1) + authority(33).
         let mut data = vec![0u8];
+        data.extend_from_slice(&999u64.to_le_bytes());
+        data.push(0);
         data.extend_from_slice(&[0xAAu8; 33]);
-        data.extend_from_slice(&[0xFF, 0xFF]); // 2 extra bytes → 35 total → error
+        data.push(0xFF);
         let result = MachineWalletInstruction::unpack(&data);
         assert_eq!(result.unwrap_err(), ProgramError::InvalidInstructionData);
     }
@@ -1312,32 +1309,10 @@ mod tests {
         assert_eq!(result.unwrap_err(), ProgramError::InvalidInstructionData);
     }
 
-    // ─── CreateWallet backward-compat tests ───────────────────────────────────
-
-    #[test]
-    fn test_parse_create_wallet_old_format() {
-        // 33 bytes: old format, sig_scheme should default to 0 (Secp256r1)
-        let mut data = vec![0u8]; // discriminator
-        let authority = [0x02u8; 33];
-        data.extend_from_slice(&authority);
-
-        let ix = MachineWalletInstruction::unpack(&data).unwrap();
-        match ix {
-            MachineWalletInstruction::CreateWallet {
-                sig_scheme,
-                authority: a,
-            } => {
-                assert_eq!(sig_scheme, 0); // SIG_SCHEME_SECP256R1
-                assert_eq!(a, authority);
-            }
-            _ => panic!("Expected CreateWallet"),
-        }
-    }
-
     #[test]
     fn test_parse_create_wallet_new_format() {
-        // 34 bytes: new format with explicit sig_scheme
         let mut data = vec![0u8]; // discriminator
+        data.extend_from_slice(&123u64.to_le_bytes());
         data.push(0x01); // sig_scheme = 1
         let authority = [0x03u8; 33];
         data.extend_from_slice(&authority);
@@ -1345,14 +1320,26 @@ mod tests {
         let ix = MachineWalletInstruction::unpack(&data).unwrap();
         match ix {
             MachineWalletInstruction::CreateWallet {
+                max_slot,
                 sig_scheme,
                 authority: a,
             } => {
+                assert_eq!(max_slot, 123);
                 assert_eq!(sig_scheme, 1);
                 assert_eq!(a, authority);
             }
             _ => panic!("Expected CreateWallet"),
         }
+    }
+
+    #[test]
+    fn test_parse_create_wallet_old_format_rejected() {
+        let mut data = vec![0u8]; // discriminator
+        data.extend_from_slice(&[0x02u8; 33]);
+        assert_eq!(
+            MachineWalletInstruction::unpack(&data).unwrap_err(),
+            ProgramError::InvalidInstructionData
+        );
     }
 
     // ─── ProvideWebAuthnEvidence sidecar parsing ─────────────────────────────

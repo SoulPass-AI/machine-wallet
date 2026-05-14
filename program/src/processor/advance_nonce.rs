@@ -59,9 +59,7 @@ pub fn process(
     }
 
     // 2. Validate instructions sysvar
-    if *instructions_sysvar.key != solana_program::sysvar::instructions::ID {
-        return Err(ProgramError::InvalidAccountData);
-    }
+    super::require_instructions_sysvar(instructions_sysvar)?;
 
     // 3. Anti-reentry: stack_height == TRANSACTION_LEVEL_STACK_HEIGHT guarantees we are
     //    a top-level instruction, not reached via any CPI chain.
@@ -109,14 +107,8 @@ pub fn process(
     )?;
 
     // 9. Increment nonce (invalidates any pending signed operations with the old nonce)
-    let new_nonce = wallet
-        .nonce
-        .checked_add(1)
-        .ok_or(MachineWalletError::InvalidNonce)?;
-
     let mut data = wallet_account.try_borrow_mut_data()?;
-    let nonce_off = wallet.nonce_offset();
-    data[nonce_off..nonce_off + 8].copy_from_slice(&new_nonce.to_le_bytes());
+    wallet.write_incremented_nonce(&mut data)?;
 
     Ok(())
 }

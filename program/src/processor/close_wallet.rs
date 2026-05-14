@@ -96,9 +96,7 @@ pub fn process(
     )?;
 
     // 3. Validate instructions sysvar
-    if *instructions_sysvar.key != solana_program::sysvar::instructions::ID {
-        return Err(ProgramError::InvalidAccountData);
-    }
+    super::require_instructions_sysvar(instructions_sysvar)?;
 
     // 4. Anti-reentry: stack_height == TRANSACTION_LEVEL_STACK_HEIGHT guarantees we are
     //    a top-level instruction, not reached via any CPI chain.
@@ -170,12 +168,31 @@ pub fn process(
         &expected_message,
     )?;
 
-    // 14. Drain vault SOL to destination via system_program::transfer CPI.
-    //     Vault stays system-owned. Vault reuse across a close+recreate is NOT
-    //     a replay concern by itself — the vault PDA is deterministic from the
-    //     wallet pubkey, and any asset it holds is reachable only via signing
-    //     over the wallet's state machine. The replay surface is the wallet
-    //     PDA; the vault tombstone follows from tombstoning the wallet.
+    // 12. Bump nonce (replay-protect the close itself) and creation_slot.
+    //     Bumping creation_slot is the load-bearing piece: SessionExecute step 12
+    //     rejects any session whose wallet_creation_slot mismatches the wallet's,
+    //     so every pre-existing session is killed atomically with the close — a
+    //     leaked session key cannot drain residual SPL/NFT assets afterwards.
+    //     Wallet state survives so the owner can still recover those assets.
+    let new_nonce = wallet
+        .nonce
+        .checked_add(1)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    let new_creation_slot = wallet
+        .creation_slot
+        .checked_add(1)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    {
+        let mut data = wallet_account.try_borrow_mut_data()?;
+        let nonce_off = wallet.nonce_offset();
+        data[nonce_off..nonce_off + 8].copy_from_slice(&new_nonce.to_le_bytes());
+        let cs_off = wallet.creation_slot_offset();
+        data[cs_off..cs_off + 8].copy_from_slice(&new_creation_slot.to_le_bytes());
+    }
+
+    // 13. Drain vault SOL via CPI; vault stays system-owned. SPL/NFT assets
+    //     in vault-owned token accounts are intentionally not touched here
+    //     (the program cannot enumerate them) and remain recoverable via Execute.
     let vault_lamports = vault_account.lamports();
     if vault_lamports > 0 {
         let vault_signer_seeds: &[&[u8]] = &[
@@ -194,86 +211,18 @@ pub fn process(
         )?;
     }
 
-    // 15. TOMBSTONE the wallet PDA — first-principles fix for the
-    //     close-then-recreate replay surface.
-    //
-    //     PROBLEM (what a plain zero-lamport drain would allow):
-    //     Solana's `Clock::slot` advances per-slot, NOT per-transaction. All
-    //     transactions within a single slot observe the same `clock.slot`
-    //     value. If we drained this PDA to zero lamports, the runtime would
-    //     reclaim the account at tx end (owner → SystemProgram, data_len → 0),
-    //     making the seeds available to a fresh `CreateWallet` in ANY later
-    //     transaction — including a LATER TX IN THE SAME SLOT. The resurrected
-    //     wallet would carry identical `wallet_id`, identical wallet PDA,
-    //     identical vault PDA, identical `creation_slot` (same slot!), and
-    //     `nonce = 0`. Any owner-signed Execute with `(nonce=0,
-    //     creation_slot=S)` pre-signed but not yet broadcast would match
-    //     byte-for-byte and replay against the new wallet, with full signing
-    //     authority over the vault's still-extant SPL-token / NFT associated
-    //     accounts.
-    //
-    //     The weaker "historical authority" variant does not even require
-    //     same-slot timing: a previously-rotated-out authority whose private
-    //     key was compromised can call permissionless `CreateWallet` at any
-    //     future slot, seize the seeds, and drain residual vault-ATA assets
-    //     with freshly-signed Executes.
-    //
-    //     FIX: keep the PDA alive forever as a 1-byte tombstone:
-    //       (a) owned by `program_id` — so `init_pda_account`'s
-    //           `owner == program_id → WalletAlreadyInitialized` short-circuit
-    //           blocks every future `CreateWallet` on these seeds, forever;
-    //       (b) funded at exactly `rent.minimum_balance(1)` — so the runtime's
-    //           zero-lamport GC never fires and (a) cannot be undone by
-    //           reassignment;
-    //       (c) stamped with `data[0] = CLOSED_MARKER (0xFF)` — so every
-    //           state-reading processor's `deserialize_runtime` returns
-    //           `InvalidAccountData` at the version-dispatch step, hard-
-    //           failing any accidental or malicious re-entry against this
-    //           PDA without requiring per-processor guards.
-    //
-    //     COST — WHY WE SHRINK TO 1 BYTE:
-    //     The original account was sized for its authority list (87 B for a
-    //     1-auth v1 wallet, up to 597 B for a 16-auth v1 wallet). Keeping
-    //     that full size as a tombstone would permanently lock ~0.0015 to
-    //     ~0.0050 SOL per closed wallet. But the tombstone only needs ONE
-    //     byte of data — byte 0 carrying `CLOSED_MARKER`. We therefore
-    //     `resize(1)` first, which drops the permanent lock to
-    //     `rent.minimum_balance(1) ≈ 0.000898 SOL` (all within the Solana
-    //     128-byte per-account overhead — shrinking to 0 bytes would only
-    //     save ~7k lamports more while losing the explicit sentinel, so
-    //     1 byte is the right point on the size/clarity curve).
-    //
-    //     The rent freed by shrinking (plus any historical over-funding or
-    //     `RemoveAuthority`-shrink residue) flows to `destination`. For a
-    //     max-size wallet this returns ~82% of the original rent.
-    const TOMBSTONE_SIZE: usize = 1;
-    wallet_account.resize(TOMBSTONE_SIZE)?;
+    // 14. Reclaim only excess lamports; keep the wallet rent-exempt so the
+    //     runtime never GCs it and close+recreate replay stays impossible.
     let rent = Rent::get()?;
-    let required_tombstone_lamports = rent.minimum_balance(TOMBSTONE_SIZE);
+    let required_wallet_lamports = rent.minimum_balance(wallet_account.data_len());
     let current_wallet_lamports = wallet_account.lamports();
-    // `resize` does not touch lamports. `minimum_balance(1)` is well below
-    // `minimum_balance(old_size)` for any real wallet, so `current >=
-    // required` always holds and `saturating_sub` is defensive only.
-    let excess = current_wallet_lamports.saturating_sub(required_tombstone_lamports);
+    let excess = current_wallet_lamports.saturating_sub(required_wallet_lamports);
     if excess > 0 {
         **wallet_account.try_borrow_mut_lamports()? = current_wallet_lamports - excess;
         **destination.try_borrow_mut_lamports()? = destination
             .lamports()
             .checked_add(excess)
             .ok_or(ProgramError::ArithmeticOverflow)?;
-    }
-
-    // 16. Stamp the CLOSED_MARKER. After this point:
-    //       - deserialize_runtime(this account) → InvalidAccountData (version
-    //         byte is 0xFF, not 0 or 1; and shrunk buffers fail the length
-    //         check inside deserialize_v0/v1 anyway — defense-in-depth)
-    //       - init_pda_account(this PDA) → WalletAlreadyInitialized (owner is
-    //         program_id, short-circuits before the SystemProgram / empty /
-    //         executable checks)
-    //     Both branches fail closed without any version-aware logic in callers.
-    {
-        let mut data = wallet_account.try_borrow_mut_data()?;
-        data[0] = MachineWallet::CLOSED_MARKER;
     }
 
     Ok(())
@@ -283,59 +232,16 @@ pub fn process(
 mod tests {
     use super::*;
 
-    /// The tombstone sentinel MUST live outside the valid-version space.
-    /// If a future layout upgrade introduced `version = 0xFF` as a real
-    /// format, tombstoned wallets could be mis-deserialized as live state
-    /// and re-authorized — collapsing the whole close-replay defense.
-    /// Keeping this at 0xFF (and keeping valid versions monotonically small)
-    /// is a load-bearing invariant. This test fails loudly if either side
-    /// drifts.
+    /// Recoverable close keeps the real wallet account alive, so the retained
+    /// rent must cover the full serialized wallet size.
     #[test]
-    fn test_closed_marker_disjoint_from_valid_versions() {
-        assert_eq!(MachineWallet::CLOSED_MARKER, 0xFF);
-        assert_ne!(MachineWallet::CLOSED_MARKER, 0); // v0
-        assert_ne!(MachineWallet::CLOSED_MARKER, 1); // v1
-    }
-
-    /// A tombstoned wallet's bytes must not parse back into any live layout.
-    /// This is the property that lets every other processor fail-closed on
-    /// tombstones without per-processor guards. Covers three buffer sizes
-    /// that could plausibly appear after a resize:
-    ///   - 1 byte (the canonical post-close tombstone shape)
-    ///   - v0/v1 1-auth layout (if a future patch ever forgot to shrink)
-    ///   - max-size v1 layout with 16 authorities
-    #[test]
-    fn test_tombstoned_bytes_fail_deserialize() {
-        let tombstone_buf = [MachineWallet::CLOSED_MARKER];
-        let mut legacy_buf = [0u8; MachineWallet::LEN];
-        legacy_buf[0] = MachineWallet::CLOSED_MARKER;
-        let mut big_buf = vec![0u8; MachineWallet::v1_account_size(16)];
-        big_buf[0] = MachineWallet::CLOSED_MARKER;
-
-        assert!(MachineWallet::deserialize(&tombstone_buf).is_err());
-        assert!(MachineWallet::deserialize_runtime(&tombstone_buf).is_err());
-        assert!(MachineWallet::deserialize(&legacy_buf).is_err());
-        assert!(MachineWallet::deserialize_runtime(&legacy_buf).is_err());
-        assert!(MachineWallet::deserialize(&big_buf).is_err());
-        assert!(MachineWallet::deserialize_runtime(&big_buf).is_err());
-    }
-
-    /// Rent floor sanity check — documents the permanent-lock cost and
-    /// catches accidental drift if `TOMBSTONE_SIZE` ever gets bumped. The
-    /// absolute numbers below depend on Solana's rent parameters; we assert
-    /// only structural inequalities that remain true under any reasonable
-    /// parameter change.
-    #[test]
-    fn test_tombstone_rent_is_minimal() {
+    fn test_recoverable_close_rent_floor_is_wallet_sized() {
         use solana_program::rent::Rent;
         let rent = Rent::default();
-        let tombstone_rent = rent.minimum_balance(1);
-        // A 1-byte tombstone must cost strictly less than any real wallet
-        // size — otherwise shrinking provides no refund.
         let min_wallet_rent = rent.minimum_balance(MachineWallet::LEN);
         let max_wallet_rent = rent.minimum_balance(MachineWallet::v1_account_size(16));
-        assert!(tombstone_rent < min_wallet_rent);
-        assert!(tombstone_rent < max_wallet_rent);
+        assert!(min_wallet_rent > 0);
+        assert!(max_wallet_rent >= min_wallet_rent);
     }
 
     #[test]

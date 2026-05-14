@@ -73,9 +73,7 @@ pub fn process(
     }
 
     // Validate instructions sysvar
-    if *instructions_sysvar.key != solana_program::sysvar::instructions::ID {
-        return Err(ProgramError::InvalidAccountData);
-    }
+    super::require_instructions_sysvar(instructions_sysvar)?;
 
     // 2. Anti-reentry: stack_height == TRANSACTION_LEVEL_STACK_HEIGHT guarantees we are
     //    a top-level instruction, not reached via any CPI chain.
@@ -159,14 +157,9 @@ pub fn process(
     )?;
 
     // 10. Increment nonce (CEI pattern — state change before side effects)
-    let new_nonce = wallet
-        .nonce
-        .checked_add(1)
-        .ok_or(MachineWalletError::InvalidNonce)?;
     {
         let mut wallet_data = wallet_account.try_borrow_mut_data()?;
-        let nonce_off = wallet.nonce_offset();
-        wallet_data[nonce_off..nonce_off + 8].copy_from_slice(&new_nonce.to_le_bytes());
+        wallet.write_incremented_nonce(&mut wallet_data)?;
     }
 
     // 11. Set revoked flag

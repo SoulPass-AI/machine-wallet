@@ -117,29 +117,6 @@ impl MachineWallet {
     /// Total serialized size in bytes for v0 (fixed part, single authority).
     pub const LEN: usize = 1 + 1 + 32 + 1 + 1 + 1 + 33 + 8 + 8 + 1; // 87
 
-    /// Sentinel version byte written by `close_wallet` to make the PDA a
-    /// permanent tombstone. Chosen as 0xFF because:
-    ///
-    ///   1. It cannot collide with any valid layout version (currently 0 or 1,
-    ///      future versions must stay monotonically small).
-    ///   2. `deserialize_runtime` already dispatches on `src[0]` and returns
-    ///      `InvalidAccountData` for any unknown version, so every
-    ///      state-reading processor (Execute, AdvanceNonce, CreateSession,
-    ///      SessionExecute, RevokeSession, AddAuthority, RemoveAuthority,
-    ///      SetThreshold, OwnerCloseSession, CloseWallet) fails closed on a
-    ///      tombstoned PDA *without* needing per-processor guards.
-    ///   3. Combined with preserving `program_id` ownership + rent-exempt
-    ///      lamports, the runtime never zero-lamport-GCs the account, so
-    ///      `init_pda_account` (which short-circuits on
-    ///      `pda_account.owner == program_id`) can never accept a
-    ///      `CreateWallet` for the same PDA seeds — not in the next slot,
-    ///      not in the next year.
-    ///
-    /// See `processor::close_wallet` for the full tombstone-invariant
-    /// rationale (why this is the first-principles fix for
-    /// close-then-recreate replay of pre-signed Executes).
-    pub const CLOSED_MARKER: u8 = 0xFF;
-
     // --- V0 offsets (kept for backward compatibility and migration) ---
 
     /// Byte offset of the nonce field within v0 serialized state.
@@ -170,6 +147,29 @@ impl MachineWallet {
             0 => Self::V0_NONCE_OFFSET,
             _ => Self::V1_NONCE_OFFSET,
         }
+    }
+
+    /// Increment the nonce in a serialized wallet buffer using the version-aware
+    /// offset. Single point of change for nonce-bump semantics across every
+    /// state-mutating processor.
+    ///
+    /// Not used by:
+    /// - CloseWallet: also bumps creation_slot in the same write, so the two
+    ///   field writes stay co-located (see close_wallet.rs step 12).
+    /// - AddAuthority v0→v1 migration: the wallet is loaded as v0, but the
+    ///   buffer being written is the new v1 layout — this helper would write at
+    ///   the v0 offset and corrupt the migrated state.
+    pub fn write_incremented_nonce(&self, data: &mut [u8]) -> Result<(), ProgramError> {
+        let new_nonce = self
+            .nonce
+            .checked_add(1)
+            .ok_or(crate::error::MachineWalletError::InvalidNonce)?;
+        let off = self.nonce_offset();
+        if data.len() < off + 8 {
+            return Err(ProgramError::AccountDataTooSmall);
+        }
+        data[off..off + 8].copy_from_slice(&new_nonce.to_le_bytes());
+        Ok(())
     }
 
     /// Version-aware creation_slot offset.

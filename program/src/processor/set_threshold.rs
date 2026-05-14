@@ -65,9 +65,7 @@ pub fn process(
     if wallet_account.owner != program_id {
         return Err(ProgramError::IncorrectProgramId);
     }
-    if *instructions_sysvar.key != solana_program::sysvar::instructions::ID {
-        return Err(ProgramError::InvalidAccountData);
-    }
+    super::require_instructions_sysvar(instructions_sysvar)?;
 
     // 3. Signature expiry
     let clock = Clock::get()?;
@@ -114,25 +112,13 @@ pub fn process(
         &expected_message,
     )?;
 
-    // 9. Write: update threshold byte, increment nonce (version-aware offset)
-    let new_nonce = wallet
-        .nonce
-        .checked_add(1)
-        .ok_or(MachineWalletError::InvalidNonce)?;
-
+    // 9. Update threshold byte and bump nonce. Threshold sits at byte 35 in v0
+    //    (after the header-level sig_scheme), byte 34 in v1; nonce write is
+    //    delegated to the version-aware helper.
     let mut data = wallet_account.try_borrow_mut_data()?;
-
-    if wallet.version == 0 {
-        // v0 layout: threshold at offset 35, nonce at V0_NONCE_OFFSET
-        data[35] = new_threshold;
-        data[MachineWallet::V0_NONCE_OFFSET..MachineWallet::V0_NONCE_OFFSET + 8]
-            .copy_from_slice(&new_nonce.to_le_bytes());
-    } else {
-        // v1 layout: threshold at offset 34, nonce at V1_NONCE_OFFSET (36)
-        data[34] = new_threshold;
-        data[MachineWallet::V1_NONCE_OFFSET..MachineWallet::V1_NONCE_OFFSET + 8]
-            .copy_from_slice(&new_nonce.to_le_bytes());
-    }
+    let threshold_off = if wallet.version == 0 { 35 } else { 34 };
+    data[threshold_off] = new_threshold;
+    wallet.write_incremented_nonce(&mut data)?;
 
     Ok(())
 }

@@ -85,9 +85,7 @@ pub fn process(
     if wallet_account.owner != program_id || session_account.owner != program_id {
         return Err(ProgramError::IncorrectProgramId);
     }
-    if *instructions_sysvar.key != solana_program::sysvar::instructions::ID {
-        return Err(ProgramError::InvalidAccountData);
-    }
+    super::require_instructions_sysvar(instructions_sysvar)?;
 
     validate_destination(session_account.key, &destination_pubkey, destination)?;
 
@@ -165,14 +163,9 @@ pub fn process(
         &expected_message,
     )?;
 
-    let new_nonce = wallet
-        .nonce
-        .checked_add(1)
-        .ok_or(MachineWalletError::InvalidNonce)?;
     {
         let mut data = wallet_account.try_borrow_mut_data()?;
-        let nonce_off = wallet.nonce_offset();
-        data[nonce_off..nonce_off + 8].copy_from_slice(&new_nonce.to_le_bytes());
+        wallet.write_incremented_nonce(&mut data)?;
     }
 
     session_account.try_borrow_mut_data()?.fill(0);

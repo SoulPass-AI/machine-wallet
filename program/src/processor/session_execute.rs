@@ -151,13 +151,9 @@ pub fn process(
     //           PDA-verified at session creation;
     //       (d) wallet_account.owner == program_id (step 4) rules out a
     //           non-wallet account being substituted at this address;
-    //       (e) close_wallet.rs tombstones the PDA (data[0]=CLOSED_MARKER,
-    //           owner preserved, rent-exempt) — `deserialize_runtime` (step 5
-    //           via step 11) fails `InvalidAccountData` on version byte 0xFF,
-    //           so a tombstoned wallet cannot slip past;
-    //       (f) step 12 enforces session.wallet_creation_slot == wallet.creation_slot,
-    //           which rejects any successor wallet at the same address (impossible
-    //           by (e) but checked as defense-in-depth).
+    //       (e) CloseWallet keeps the wallet PDA program-owned, rent-exempt,
+    //           and initialized, so the runtime cannot GC it and CreateWallet
+    //           cannot recreate a successor wallet at the same address.
     //
     //     Therefore re-deriving the wallet PDA here would only re-prove (b),
     //     which is already transitively established via (a)+(c)+(d). Saves
@@ -272,8 +268,10 @@ mod tests {
     /// invariant, so it fails fast if someone unknowingly deletes it.
     #[test]
     fn test_session_execute_assumes_create_session_pda_validation() {
-        let src =
-            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/processor/create_session.rs"));
+        let src = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/processor/create_session.rs"
+        ));
         // Exact tokens from the create_session wallet-PDA verification block.
         assert!(
             src.contains("Pubkey::create_program_address"),
