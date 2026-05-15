@@ -156,5 +156,15 @@ pub fn process_instruction(
             auth_data,
             client_data_json,
         } => provide_webauthn_evidence::process(program_id, accounts, auth_data, client_data_json),
+        // Compact sidecar (disc=15): no state change, just rejects CPI invocation
+        // to match precompile placement requirements. The threshold scanner reads
+        // challenge + cd_hash directly from the instructions sysvar.
+        MachineWalletInstruction::ProvideWebAuthnEvidenceCompact { .. } => {
+            use solana_program::instruction::{get_stack_height, TRANSACTION_LEVEL_STACK_HEIGHT};
+            if get_stack_height() > TRANSACTION_LEVEL_STACK_HEIGHT {
+                return Err(MachineWalletError::CpiReentryDenied.into());
+            }
+            Ok(())
+        }
     }
 }

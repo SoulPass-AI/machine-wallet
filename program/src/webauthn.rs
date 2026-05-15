@@ -111,6 +111,26 @@ pub fn encode_challenge(challenge: &[u8; 32]) -> [u8; 43] {
     base64url_encode_no_pad(challenge)
 }
 
+/// Verify authenticatorData rpIdHash and UP/UV flags without parsing clientDataJSON.
+/// Used by the compact evidence path (disc=15) where auth_data is read from the
+/// secp256r1 precompile message instead of the sidecar.
+pub fn verify_auth_data(auth_data: &[u8]) -> Result<(), ProgramError> {
+    if auth_data.len() < MIN_AUTH_DATA_SIZE || auth_data.len() > MAX_AUTH_DATA_SIZE {
+        return Err(MachineWalletError::InvalidWebAuthnAuthData.into());
+    }
+    if auth_data[..32] != EXPECTED_RP_ID_HASH {
+        return Err(MachineWalletError::WebAuthnRpIdMismatch.into());
+    }
+    let flags = auth_data[AUTH_DATA_FLAGS_OFFSET];
+    if flags & FLAG_USER_PRESENT == 0 {
+        return Err(MachineWalletError::WebAuthnUserNotPresent.into());
+    }
+    if flags & FLAG_USER_VERIFIED == 0 {
+        return Err(MachineWalletError::WebAuthnUserNotVerified.into());
+    }
+    Ok(())
+}
+
 /// Base64url encode without padding (RFC 4648 section 5).
 /// Input: 32 bytes. Output: 43 base64url chars (no padding).
 fn base64url_encode_no_pad(data: &[u8; 32]) -> [u8; 43] {
@@ -608,6 +628,75 @@ mod tests {
     fn test_extract_rejects_unterminated_escape() {
         let json = br#"{"origin":"x\"#;
         assert!(extract_type_and_challenge(json).is_err());
+    }
+
+    // ─── verify_auth_data tests ───────────────────────────────────────────────
+
+    #[test]
+    fn test_verify_auth_data_valid() {
+        let auth_data: [u8; 37] = make_auth_data();
+        assert!(verify_auth_data(&auth_data).is_ok());
+    }
+
+    #[test]
+    fn test_verify_auth_data_too_short() {
+        let auth_data = [0xAAu8; MIN_AUTH_DATA_SIZE - 1];
+        let err = verify_auth_data(&auth_data).unwrap_err();
+        assert_eq!(
+            err,
+            ProgramError::Custom(MachineWalletError::InvalidWebAuthnAuthData as u32)
+        );
+    }
+
+    #[test]
+    fn test_verify_auth_data_too_long() {
+        let auth_data = vec![0xAAu8; MAX_AUTH_DATA_SIZE + 1];
+        let err = verify_auth_data(&auth_data).unwrap_err();
+        assert_eq!(
+            err,
+            ProgramError::Custom(MachineWalletError::InvalidWebAuthnAuthData as u32)
+        );
+    }
+
+    #[test]
+    fn test_verify_auth_data_wrong_rpid() {
+        let mut auth_data: [u8; 37] = make_auth_data();
+        auth_data[0] ^= 0x01; // corrupt rpIdHash
+        let err = verify_auth_data(&auth_data).unwrap_err();
+        assert_eq!(
+            err,
+            ProgramError::Custom(MachineWalletError::WebAuthnRpIdMismatch as u32)
+        );
+    }
+
+    #[test]
+    fn test_verify_auth_data_up_clear() {
+        let mut auth_data: [u8; 37] = make_auth_data();
+        auth_data[AUTH_DATA_FLAGS_OFFSET] = FLAG_USER_VERIFIED; // UV=1, UP=0
+        let err = verify_auth_data(&auth_data).unwrap_err();
+        assert_eq!(
+            err,
+            ProgramError::Custom(MachineWalletError::WebAuthnUserNotPresent as u32)
+        );
+    }
+
+    #[test]
+    fn test_verify_auth_data_uv_clear() {
+        let mut auth_data: [u8; 37] = make_auth_data();
+        auth_data[AUTH_DATA_FLAGS_OFFSET] = FLAG_USER_PRESENT; // UP=1, UV=0
+        let err = verify_auth_data(&auth_data).unwrap_err();
+        assert_eq!(
+            err,
+            ProgramError::Custom(MachineWalletError::WebAuthnUserNotVerified as u32)
+        );
+    }
+
+    #[test]
+    fn test_verify_auth_data_max_size() {
+        let mut auth_data = vec![0xAAu8; MAX_AUTH_DATA_SIZE];
+        auth_data[..32].copy_from_slice(&EXPECTED_RP_ID_HASH);
+        auth_data[AUTH_DATA_FLAGS_OFFSET] = FLAG_USER_PRESENT | FLAG_USER_VERIFIED;
+        assert!(verify_auth_data(&auth_data).is_ok());
     }
 
     /// The hard-coded EXPECTED_RP_ID_HASH must equal SHA-256(EXPECTED_RP_ID).

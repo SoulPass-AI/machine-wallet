@@ -6,7 +6,10 @@ use solana_program::{
 use crate::{
     ed25519,
     error::MachineWalletError,
-    instruction::{parse_webauthn_evidence_payload, PROVIDE_WEBAUTHN_EVIDENCE_DISCRIMINATOR},
+    instruction::{
+        parse_webauthn_evidence_compact_payload, parse_webauthn_evidence_payload,
+        PROVIDE_WEBAUTHN_EVIDENCE_COMPACT_DISCRIMINATOR, PROVIDE_WEBAUTHN_EVIDENCE_DISCRIMINATOR,
+    },
     secp256r1,
     state::{
         AuthoritySlot, MachineWallet, MAX_AUTHORITIES, SIG_SCHEME_ED25519, SIG_SCHEME_SECP256R1,
@@ -147,6 +150,11 @@ fn verify_threshold_with_webauthn(
         [[0u8; 32]; MAX_WEBAUTHN_EVIDENCE];
     let mut sidecar_count: usize = 0;
 
+    // Compact disc=15 sidecars: store cd_hash for Pass-2 matching.
+    let mut compact_cd_hashes: [[u8; 32]; MAX_WEBAUTHN_EVIDENCE] =
+        [[0u8; 32]; MAX_WEBAUTHN_EVIDENCE];
+    let mut compact_sidecar_count: usize = 0;
+
     let expected_challenge_b64 = webauthn::encode_challenge(expected_execute_hash);
     let mut webauthn_buf = [0u8; MAX_AUTH_DATA_SIZE + 32];
     let mut ix_index: usize = 0;
@@ -157,49 +165,62 @@ fn verify_threshold_with_webauthn(
         };
         ix_index += 1;
 
-        // Identify sidecars by (our program_id, discriminator = 14).
+        // Identify sidecars by our program_id.
         if ix.program_id != *program_id {
             continue;
         }
         let Some((&disc, rest)) = ix.data.split_first() else {
             continue;
         };
-        if disc != PROVIDE_WEBAUTHN_EVIDENCE_DISCRIMINATOR {
-            continue;
-        }
 
-        // Hard cap on sidecar count — bounds Pass-1 CU against adversarial stuffing.
-        if sidecar_count >= MAX_WEBAUTHN_EVIDENCE {
-            return Err(MachineWalletError::TooManyWebAuthnEvidence.into());
-        }
-
-        let Ok((auth_data, client_data_json)) = parse_webauthn_evidence_payload(rest) else {
-            continue;
-        };
-
-        // Failure mode split:
-        //  - `WebAuthnChallengeMismatch` is op-specific — the sidecar
-        //    legitimately targets a DIFFERENT wallet op in this tx. Skip,
-        //    preserving composability.
-        //  - All other failures are op-invariant. Fail closed.
-        match webauthn::build_webauthn_message(
-            auth_data,
-            client_data_json,
-            &expected_challenge_b64,
-            &mut webauthn_buf,
-        ) {
-            Ok(len) => {
-                sidecar_hashes[sidecar_count] = keccak::hash(&webauthn_buf[..len]).to_bytes();
-                sidecar_count += 1;
+        if disc == PROVIDE_WEBAUTHN_EVIDENCE_DISCRIMINATOR {
+            // Hard cap on sidecar count — bounds Pass-1 CU against adversarial stuffing.
+            if sidecar_count >= MAX_WEBAUTHN_EVIDENCE {
+                return Err(MachineWalletError::TooManyWebAuthnEvidence.into());
             }
-            Err(e)
-                if e == ProgramError::Custom(
-                    MachineWalletError::WebAuthnChallengeMismatch as u32,
-                ) =>
-            {
+
+            let Ok((auth_data, client_data_json)) = parse_webauthn_evidence_payload(rest) else {
+                continue;
+            };
+
+            // Failure mode split:
+            //  - `WebAuthnChallengeMismatch` is op-specific — the sidecar
+            //    legitimately targets a DIFFERENT wallet op in this tx. Skip,
+            //    preserving composability.
+            //  - All other failures are op-invariant. Fail closed.
+            match webauthn::build_webauthn_message(
+                auth_data,
+                client_data_json,
+                &expected_challenge_b64,
+                &mut webauthn_buf,
+            ) {
+                Ok(len) => {
+                    sidecar_hashes[sidecar_count] = keccak::hash(&webauthn_buf[..len]).to_bytes();
+                    sidecar_count += 1;
+                }
+                Err(e)
+                    if e == ProgramError::Custom(
+                        MachineWalletError::WebAuthnChallengeMismatch as u32,
+                    ) =>
+                {
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        } else if disc == PROVIDE_WEBAUTHN_EVIDENCE_COMPACT_DISCRIMINATOR {
+            // Compact sidecar (disc=15): challenge + cd_hash only.
+            if sidecar_count + compact_sidecar_count >= MAX_WEBAUTHN_EVIDENCE {
+                return Err(MachineWalletError::TooManyWebAuthnEvidence.into());
+            }
+            let Ok((challenge, cd_hash)) = parse_webauthn_evidence_compact_payload(rest) else {
+                continue;
+            };
+            // challenge mismatch → sidecar targets a different op in this tx, skip.
+            if challenge != expected_challenge_b64 {
                 continue;
             }
-            Err(e) => return Err(e),
+            compact_cd_hashes[compact_sidecar_count] = cd_hash;
+            compact_sidecar_count += 1;
         }
     }
 
@@ -228,7 +249,7 @@ fn verify_threshold_with_webauthn(
                         &pubkey,
                     );
                 }
-            } else if sidecar_count > 0 {
+            } else if sidecar_count > 0 || compact_sidecar_count > 0 {
                 // Variable-length message → try matching against each sidecar.
                 // Skip the keccak syscall when the message length is outside
                 // any valid WebAuthn range (auth_data ‖ SHA256(cd)).
@@ -237,16 +258,43 @@ fn verify_threshold_with_webauthn(
                     const MIN_WEBAUTHN_MSG: usize = MIN_AUTH_DATA_SIZE + 32;
                     const MAX_WEBAUTHN_MSG: usize = MAX_AUTH_DATA_SIZE + 32;
                     if (MIN_WEBAUTHN_MSG..=MAX_WEBAUTHN_MSG).contains(&msg_bytes.len()) {
-                        let msg_hash = keccak::hash(msg_bytes).to_bytes();
-                        if (0..sidecar_count).any(|s| sidecar_hashes[s] == msg_hash) {
-                            match_authority(
-                                authorities,
-                                count,
-                                &mut authority_matched,
-                                &mut matched_count,
-                                SIG_SCHEME_WEBAUTHN,
-                                &pubkey,
-                            );
+                        // Disc=14 path: keccak(auth_data ‖ sha256(cd)) matches a stored hash.
+                        if sidecar_count > 0 {
+                            let msg_hash = keccak::hash(msg_bytes).to_bytes();
+                            if (0..sidecar_count).any(|s| sidecar_hashes[s] == msg_hash) {
+                                match_authority(
+                                    authorities,
+                                    count,
+                                    &mut authority_matched,
+                                    &mut matched_count,
+                                    SIG_SCHEME_WEBAUTHN,
+                                    &pubkey,
+                                );
+                            }
+                        }
+
+                        // Disc=15 compact path: cd_hash == last 32 bytes of precompile message,
+                        // then verify auth_data (first msg_bytes.len()-32 bytes) directly.
+                        if compact_sidecar_count > 0 {
+                            let cd_hash_in_msg = &msg_bytes[msg_bytes.len() - 32..];
+                            if (0..compact_sidecar_count)
+                                .any(|s| compact_cd_hashes[s] == cd_hash_in_msg)
+                            {
+                                let auth_data = &msg_bytes[..msg_bytes.len() - 32];
+                                match webauthn::verify_auth_data(auth_data) {
+                                    Ok(()) => {
+                                        match_authority(
+                                            authorities,
+                                            count,
+                                            &mut authority_matched,
+                                            &mut matched_count,
+                                            SIG_SCHEME_WEBAUTHN,
+                                            &pubkey,
+                                        );
+                                    }
+                                    Err(e) => return Err(e),
+                                }
+                            }
                         }
                     }
                 }

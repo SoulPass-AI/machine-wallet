@@ -155,6 +155,10 @@ impl InnerInstructionRef<'_> {
 ///   Sidecar instruction — no state change. Its presence in the tx makes the
 ///   carried auth_data / clientDataJSON available to every wallet instruction
 ///   in the same tx for WEBAUTHN-scheme threshold contribution.
+/// - ProvideWebAuthnEvidenceCompact: [15] + challenge (43 bytes) + cd_hash (32 bytes)
+///   Compact sidecar for single-authority passkey wallets. Saves ~105 bytes vs disc=14
+///   by omitting auth_data and clientDataJSON — auth_data is read directly from the
+///   secp256r1 precompile message by the threshold scanner.
 ///
 /// Inner instruction wire format:
 ///   program_id (32) + accounts_len (u16 LE) + data_len (u16 LE) + accounts (accounts_len * 2 bytes: index + flags) + data
@@ -258,6 +262,19 @@ pub enum MachineWalletInstruction<'a> {
     ProvideWebAuthnEvidence {
         auth_data: &'a [u8],
         client_data_json: &'a [u8],
+    },
+
+    /// Compact sidecar for WebAuthn passkey assertions (disc=15).
+    /// Replaces ProvideWebAuthnEvidence (disc=14) for single-authority wallets.
+    /// Carries only the base64url challenge and sha256(clientDataJSON) — auth_data
+    /// is read from the secp256r1 precompile message by the threshold scanner.
+    ///
+    /// Wire format: challenge (43 bytes) + cd_hash (32 bytes) = 75 bytes total.
+    /// Saves ~105 bytes vs disc=14, enabling complex swap operations within the
+    /// 1232-byte Solana transaction size limit.
+    ProvideWebAuthnEvidenceCompact {
+        challenge: [u8; 43],
+        cd_hash: [u8; 32],
     },
 }
 
@@ -555,6 +572,13 @@ impl<'a> MachineWalletInstruction<'a> {
                 })
             }
 
+            // ProvideWebAuthnEvidenceCompact (compact sidecar, disc=15).
+            // No state change. Fixed 75-byte payload: challenge (43) + cd_hash (32).
+            15 => {
+                let (challenge, cd_hash) = parse_webauthn_evidence_compact_payload(rest)?;
+                Ok(Self::ProvideWebAuthnEvidenceCompact { challenge, cd_hash })
+            }
+
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
@@ -564,6 +588,31 @@ impl<'a> MachineWalletInstruction<'a> {
 /// scanner can recognize sidecar instructions without depending on the
 /// full enum.
 pub const PROVIDE_WEBAUTHN_EVIDENCE_DISCRIMINATOR: u8 = 14;
+
+/// Discriminator for `ProvideWebAuthnEvidenceCompact`. Exposed so the threshold
+/// scanner can recognize compact sidecar instructions without depending on the
+/// full enum.
+pub const PROVIDE_WEBAUTHN_EVIDENCE_COMPACT_DISCRIMINATOR: u8 = 15;
+
+/// Parse a ProvideWebAuthnEvidenceCompact payload (disc=15).
+///
+/// Wire format (no length prefix, fixed-size):
+///   challenge : [u8; 43]   // base64url_nopad(operation_hash)
+///   cd_hash   : [u8; 32]   // sha256(clientDataJSON)
+///
+/// Returns `(challenge, cd_hash)` as fixed-size arrays.
+pub(crate) fn parse_webauthn_evidence_compact_payload(
+    data: &[u8],
+) -> Result<([u8; 43], [u8; 32]), ProgramError> {
+    if data.len() != 43 + 32 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let mut challenge = [0u8; 43];
+    challenge.copy_from_slice(&data[..43]);
+    let mut cd_hash = [0u8; 32];
+    cd_hash.copy_from_slice(&data[43..75]);
+    Ok((challenge, cd_hash))
+}
 
 #[cfg(test)]
 mod tests {
@@ -1397,5 +1446,88 @@ mod tests {
         let data = vec![13u8];
         let err = MachineWalletInstruction::unpack(&data).unwrap_err();
         assert_eq!(err, ProgramError::InvalidInstructionData);
+    }
+
+    // ─── ProvideWebAuthnEvidenceCompact (disc=15) parsing ─────────────────────
+
+    fn build_compact_sidecar_data(challenge: &[u8; 43], cd_hash: &[u8; 32]) -> Vec<u8> {
+        let mut data = vec![15u8]; // discriminator
+        data.extend_from_slice(challenge);
+        data.extend_from_slice(cd_hash);
+        data
+    }
+
+    #[test]
+    fn test_parse_compact_sidecar_valid() {
+        let challenge = [0x41u8; 43]; // 'A' repeated
+        let cd_hash = [0xBBu8; 32];
+        let data = build_compact_sidecar_data(&challenge, &cd_hash);
+        assert_eq!(data.len(), 1 + 43 + 32); // disc + payload
+
+        let ix = MachineWalletInstruction::unpack(&data).unwrap();
+        match ix {
+            MachineWalletInstruction::ProvideWebAuthnEvidenceCompact {
+                challenge: c,
+                cd_hash: h,
+            } => {
+                assert_eq!(c, challenge);
+                assert_eq!(h, cd_hash);
+            }
+            _ => panic!("Expected ProvideWebAuthnEvidenceCompact"),
+        }
+    }
+
+    #[test]
+    fn test_compact_sidecar_discriminator_constant() {
+        assert_eq!(PROVIDE_WEBAUTHN_EVIDENCE_COMPACT_DISCRIMINATOR, 15);
+    }
+
+    #[test]
+    fn test_compact_sidecar_empty_payload_rejected() {
+        let data = vec![15u8]; // discriminator only — no payload
+        let err = MachineWalletInstruction::unpack(&data).unwrap_err();
+        assert_eq!(err, ProgramError::InvalidInstructionData);
+    }
+
+    #[test]
+    fn test_compact_sidecar_truncated_payload_rejected() {
+        // Only 43 bytes (challenge) — missing cd_hash
+        let mut data = vec![15u8];
+        data.extend_from_slice(&[0x41u8; 43]);
+        let err = MachineWalletInstruction::unpack(&data).unwrap_err();
+        assert_eq!(err, ProgramError::InvalidInstructionData);
+    }
+
+    #[test]
+    fn test_compact_sidecar_trailing_byte_rejected() {
+        let challenge = [0x41u8; 43];
+        let cd_hash = [0xBBu8; 32];
+        let mut data = build_compact_sidecar_data(&challenge, &cd_hash);
+        data.push(0xFF); // trailing garbage
+        let err = MachineWalletInstruction::unpack(&data).unwrap_err();
+        assert_eq!(err, ProgramError::InvalidInstructionData);
+    }
+
+    #[test]
+    fn test_compact_sidecar_one_byte_short_rejected() {
+        // 74 bytes instead of 75
+        let mut data = vec![15u8];
+        data.extend_from_slice(&[0u8; 74]);
+        let err = MachineWalletInstruction::unpack(&data).unwrap_err();
+        assert_eq!(err, ProgramError::InvalidInstructionData);
+    }
+
+    #[test]
+    fn test_parse_compact_sidecar_all_zeros() {
+        // Zero-value challenge and cd_hash — structurally valid (semantic check
+        // is in the threshold scanner, not the parser).
+        let challenge = [0u8; 43];
+        let cd_hash = [0u8; 32];
+        let data = build_compact_sidecar_data(&challenge, &cd_hash);
+        let ix = MachineWalletInstruction::unpack(&data).unwrap();
+        assert!(matches!(
+            ix,
+            MachineWalletInstruction::ProvideWebAuthnEvidenceCompact { .. }
+        ));
     }
 }
