@@ -40,10 +40,14 @@ pub enum MachineWalletError {
     AuthorityNotFound = 35,
     InvalidEd25519Pubkey = 36,
     InvalidWebAuthnAuthData = 40,
+    /// Unused since disc=14 removal; kept for discriminant stability.
     InvalidWebAuthnClientDataJson = 41,
+    /// Unused since disc=14 removal; kept for discriminant stability.
     WebAuthnChallengeMismatch = 42,
+    /// Unused since disc=14 removal; kept for discriminant stability.
     WebAuthnInvalidType = 43,
     WebAuthnUserNotPresent = 44,
+    /// Unused since disc=14 removal; kept for discriminant stability.
     WebAuthnDuplicateField = 45,
     WebAuthnUserNotVerified = 46,
     WebAuthnRpIdMismatch = 47,
@@ -121,9 +125,10 @@ impl std::fmt::Display for MachineWalletError {
             Self::SessionSpendCapExceeded => {
                 write!(f, "Session cumulative spend cap exceeded")
             }
-            Self::TooManyWebAuthnEvidence => {
-                write!(f, "Too many ProvideWebAuthnEvidence sidecar instructions")
-            }
+            Self::TooManyWebAuthnEvidence => write!(
+                f,
+                "Too many ProvideWebAuthnEvidenceCompact sidecar instructions"
+            ),
         }
     }
 }

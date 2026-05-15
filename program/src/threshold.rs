@@ -1,5 +1,5 @@
 use solana_program::{
-    account_info::AccountInfo, keccak, program_error::ProgramError, pubkey::Pubkey,
+    account_info::AccountInfo, program_error::ProgramError, pubkey::Pubkey,
     sysvar::instructions::load_instruction_at_checked,
 };
 
@@ -7,8 +7,7 @@ use crate::{
     ed25519,
     error::MachineWalletError,
     instruction::{
-        parse_webauthn_evidence_compact_payload, parse_webauthn_evidence_payload,
-        PROVIDE_WEBAUTHN_EVIDENCE_COMPACT_DISCRIMINATOR, PROVIDE_WEBAUTHN_EVIDENCE_DISCRIMINATOR,
+        parse_webauthn_evidence_compact_payload, PROVIDE_WEBAUTHN_EVIDENCE_COMPACT_DISCRIMINATOR,
     },
     secp256r1,
     state::{
@@ -31,10 +30,10 @@ const _: () = assert!(
     "WebAuthn msg size must differ from the 32-byte execute hash"
 );
 
-/// Maximum number of ProvideWebAuthnEvidence sidecar instructions honoured in
-/// one transaction. A sidecar beyond this cap means the transaction is paying
-/// for more WebAuthn parsing than any legitimate wallet could consume — fail
-/// closed to bound Pass-1 CU cost.
+/// Maximum number of `ProvideWebAuthnEvidenceCompact` sidecar instructions
+/// honoured in one transaction. A sidecar beyond this cap means the
+/// transaction is paying for more WebAuthn matching than any legitimate
+/// wallet could consume — fail closed to bound Pass-1 CU cost.
 ///
 /// Sized to match MAX_AUTHORITIES: even a fully passkey-backed N-of-N wallet
 /// only needs N sidecars, and no wallet can have more authorities than this.
@@ -50,10 +49,11 @@ pub const MAX_WEBAUTHN_EVIDENCE: usize = MAX_AUTHORITIES as usize;
 ///
 /// - **SECP256R1 / ED25519**: the scheme's built-in Solana precompile — signs
 ///   the 32-byte `expected_execute_hash` directly.
-/// - **WEBAUTHN**: a secp256r1 precompile signs `auth_data ‖ SHA256(cd)` while a
-///   separate `ProvideWebAuthnEvidence` instruction in the same tx carries
-///   `auth_data` and `clientDataJSON`, letting the scanner reconstruct the
-///   precompile's signed bytes.
+/// - **WEBAUTHN**: a secp256r1 precompile signs `auth_data ‖ SHA256(cd)` while
+///   a separate `ProvideWebAuthnEvidenceCompact` instruction in the same tx
+///   carries `base64url(operation_hash)` plus `SHA256(cd)`, letting the
+///   scanner bind the precompile's signed bytes to this operation without
+///   re-parsing clientDataJSON.
 ///
 /// This means an M-of-N wallet can combine signers of different schemes (and
 /// multiple signers of the same scheme, including multiple passkeys) in a
@@ -61,19 +61,18 @@ pub const MAX_WEBAUTHN_EVIDENCE: usize = MAX_AUTHORITIES as usize;
 ///
 /// # Algorithm
 ///
-/// **Pass 1** – sidecar collection. For each `ProvideWebAuthnEvidence`
-/// instruction, try to build a WebAuthn signed message bound to the *current*
-/// operation's `expected_execute_hash`:
-/// - if validation succeeds (rpIdHash, UP/UV flags, type, challenge bound to
-///   this op), store `keccak256(webauthn_msg)` in a scratch array;
-/// - if validation fails (most commonly: challenge targets a *different*
-///   operation in the same tx), silently skip — that sidecar legitimately
-///   belongs to a different wallet instruction.
+/// **Pass 1** – sidecar collection. For each `ProvideWebAuthnEvidenceCompact`
+/// instruction, check the sidecar's challenge against
+/// `base64url(expected_execute_hash)`:
+/// - if equal, store its `cd_hash` in a scratch array;
+/// - if not equal, silently skip — that sidecar legitimately belongs to a
+///   different wallet instruction in the same tx.
 ///
 /// **Pass 2** – precompile matching.
 /// - `secp256r1` + 32-byte message == `expected_execute_hash` → SECP256R1 slot.
-/// - `secp256r1` + message of some valid WebAuthn size and `keccak256(msg)` in
-///   the sidecar-hash set → WEBAUTHN slot.
+/// - `secp256r1` + message of some valid WebAuthn size whose 32-byte tail
+///   equals a stored `cd_hash` and whose head passes `verify_auth_data`
+///   (length, rpIdHash, UP/UV) → WEBAUTHN slot.
 /// - `ed25519` + 32-byte message == `expected_execute_hash` → ED25519 slot.
 ///
 /// # Security properties
@@ -82,9 +81,9 @@ pub const MAX_WEBAUTHN_EVIDENCE: usize = MAX_AUTHORITIES as usize;
 /// - `signature_count == 1` enforced by the precompile parsers.
 /// - Early exit once threshold is met (saves CU).
 /// - MAX_WEBAUTHN_EVIDENCE caps CU cost of Pass 1.
-/// - Fail-open on per-sidecar validation: composable with multiple wallet
-///   instructions in one tx, while a *truly* malformed sidecar contributes
-///   nothing to any op (so it can only waste its own paid fee).
+/// - Fail-open on per-sidecar challenge mismatch: composable with multiple
+///   wallet instructions in one tx, while a truly malformed sidecar
+///   contributes nothing to any op (so it can only waste its own paid fee).
 pub fn verify_threshold_signatures(
     instructions_sysvar: &AccountInfo,
     program_id: &Pubkey,
@@ -131,10 +130,10 @@ pub fn verify_threshold_signatures(
 
 /// Threshold verification for wallets with at least one WEBAUTHN authority.
 ///
-/// Two passes: (1) scan for ProvideWebAuthnEvidence sidecars to build
-/// keccak256(auth_data ‖ SHA256(cd)) set; (2) match each precompile ix
-/// against the authority list, including variable-length secp256r1 msgs
-/// against the sidecar set.
+/// Two passes: (1) scan for `ProvideWebAuthnEvidenceCompact` sidecars whose
+/// challenge matches this op, collecting their cd_hashes; (2) match each
+/// precompile ix against the authority list, including variable-length
+/// secp256r1 msgs whose 32-byte tail equals one of the collected cd_hashes.
 #[inline(never)]
 fn verify_threshold_with_webauthn(
     instructions_sysvar: &AccountInfo,
@@ -144,19 +143,11 @@ fn verify_threshold_with_webauthn(
     threshold: u8,
     expected_execute_hash: &[u8; 32],
 ) -> Result<(), ProgramError> {
-    // ── Pass 1: collect WebAuthn evidence hashes ──────────────────────────────
-    // 32B per sidecar (vs up to 544B of raw bytes) — keeps scratch footprint small.
-    let mut sidecar_hashes: [[u8; 32]; MAX_WEBAUTHN_EVIDENCE] =
-        [[0u8; 32]; MAX_WEBAUTHN_EVIDENCE];
+    // ── Pass 1: collect cd_hashes from compact sidecars matching this op ──────
+    let mut cd_hashes: [[u8; 32]; MAX_WEBAUTHN_EVIDENCE] = [[0u8; 32]; MAX_WEBAUTHN_EVIDENCE];
     let mut sidecar_count: usize = 0;
 
-    // Compact disc=15 sidecars: store cd_hash for Pass-2 matching.
-    let mut compact_cd_hashes: [[u8; 32]; MAX_WEBAUTHN_EVIDENCE] =
-        [[0u8; 32]; MAX_WEBAUTHN_EVIDENCE];
-    let mut compact_sidecar_count: usize = 0;
-
     let expected_challenge_b64 = webauthn::encode_challenge(expected_execute_hash);
-    let mut webauthn_buf = [0u8; MAX_AUTH_DATA_SIZE + 32];
     let mut ix_index: usize = 0;
     loop {
         let ix = match load_instruction_at_checked(ix_index, instructions_sysvar) {
@@ -165,63 +156,29 @@ fn verify_threshold_with_webauthn(
         };
         ix_index += 1;
 
-        // Identify sidecars by our program_id.
         if ix.program_id != *program_id {
             continue;
         }
         let Some((&disc, rest)) = ix.data.split_first() else {
             continue;
         };
-
-        if disc == PROVIDE_WEBAUTHN_EVIDENCE_DISCRIMINATOR {
-            // Hard cap on sidecar count — bounds Pass-1 CU against adversarial stuffing.
-            if sidecar_count >= MAX_WEBAUTHN_EVIDENCE {
-                return Err(MachineWalletError::TooManyWebAuthnEvidence.into());
-            }
-
-            let Ok((auth_data, client_data_json)) = parse_webauthn_evidence_payload(rest) else {
-                continue;
-            };
-
-            // Failure mode split:
-            //  - `WebAuthnChallengeMismatch` is op-specific — the sidecar
-            //    legitimately targets a DIFFERENT wallet op in this tx. Skip,
-            //    preserving composability.
-            //  - All other failures are op-invariant. Fail closed.
-            match webauthn::build_webauthn_message(
-                auth_data,
-                client_data_json,
-                &expected_challenge_b64,
-                &mut webauthn_buf,
-            ) {
-                Ok(len) => {
-                    sidecar_hashes[sidecar_count] = keccak::hash(&webauthn_buf[..len]).to_bytes();
-                    sidecar_count += 1;
-                }
-                Err(e)
-                    if e == ProgramError::Custom(
-                        MachineWalletError::WebAuthnChallengeMismatch as u32,
-                    ) =>
-                {
-                    continue;
-                }
-                Err(e) => return Err(e),
-            }
-        } else if disc == PROVIDE_WEBAUTHN_EVIDENCE_COMPACT_DISCRIMINATOR {
-            // Compact sidecar (disc=15): challenge + cd_hash only.
-            if sidecar_count + compact_sidecar_count >= MAX_WEBAUTHN_EVIDENCE {
-                return Err(MachineWalletError::TooManyWebAuthnEvidence.into());
-            }
-            let Ok((challenge, cd_hash)) = parse_webauthn_evidence_compact_payload(rest) else {
-                continue;
-            };
-            // challenge mismatch → sidecar targets a different op in this tx, skip.
-            if challenge != expected_challenge_b64 {
-                continue;
-            }
-            compact_cd_hashes[compact_sidecar_count] = cd_hash;
-            compact_sidecar_count += 1;
+        if disc != PROVIDE_WEBAUTHN_EVIDENCE_COMPACT_DISCRIMINATOR {
+            continue;
         }
+
+        // Hard cap — bounds Pass-1 CU against adversarial sidecar stuffing.
+        if sidecar_count >= MAX_WEBAUTHN_EVIDENCE {
+            return Err(MachineWalletError::TooManyWebAuthnEvidence.into());
+        }
+        let Ok((challenge, cd_hash)) = parse_webauthn_evidence_compact_payload(rest) else {
+            continue;
+        };
+        // challenge mismatch → sidecar targets a different op in this tx, skip.
+        if challenge != expected_challenge_b64 {
+            continue;
+        }
+        cd_hashes[sidecar_count] = cd_hash;
+        sidecar_count += 1;
     }
 
     // ── Pass 2: precompile matching ───────────────────────────────────────────
@@ -249,52 +206,29 @@ fn verify_threshold_with_webauthn(
                         &pubkey,
                     );
                 }
-            } else if sidecar_count > 0 || compact_sidecar_count > 0 {
-                // Variable-length message → try matching against each sidecar.
-                // Skip the keccak syscall when the message length is outside
-                // any valid WebAuthn range (auth_data ‖ SHA256(cd)).
+            } else if sidecar_count > 0 {
+                // Variable-length precompile message → try WebAuthn matching.
+                // Precompile message layout: auth_data ‖ SHA256(cd). The 32-byte
+                // tail must equal a sidecar's cd_hash and the head must satisfy
+                // auth_data invariants.
                 if let Ok((pubkey, msg_bytes)) = secp256r1::parse_precompile_data_any_len(&ix.data)
                 {
                     const MIN_WEBAUTHN_MSG: usize = MIN_AUTH_DATA_SIZE + 32;
                     const MAX_WEBAUTHN_MSG: usize = MAX_AUTH_DATA_SIZE + 32;
                     if (MIN_WEBAUTHN_MSG..=MAX_WEBAUTHN_MSG).contains(&msg_bytes.len()) {
-                        // Disc=14 path: keccak(auth_data ‖ sha256(cd)) matches a stored hash.
-                        if sidecar_count > 0 {
-                            let msg_hash = keccak::hash(msg_bytes).to_bytes();
-                            if (0..sidecar_count).any(|s| sidecar_hashes[s] == msg_hash) {
-                                match_authority(
-                                    authorities,
-                                    count,
-                                    &mut authority_matched,
-                                    &mut matched_count,
-                                    SIG_SCHEME_WEBAUTHN,
-                                    &pubkey,
-                                );
-                            }
-                        }
-
-                        // Disc=15 compact path: cd_hash == last 32 bytes of precompile message,
-                        // then verify auth_data (first msg_bytes.len()-32 bytes) directly.
-                        if compact_sidecar_count > 0 {
-                            let cd_hash_in_msg = &msg_bytes[msg_bytes.len() - 32..];
-                            if (0..compact_sidecar_count)
-                                .any(|s| compact_cd_hashes[s] == cd_hash_in_msg)
-                            {
-                                let auth_data = &msg_bytes[..msg_bytes.len() - 32];
-                                match webauthn::verify_auth_data(auth_data) {
-                                    Ok(()) => {
-                                        match_authority(
-                                            authorities,
-                                            count,
-                                            &mut authority_matched,
-                                            &mut matched_count,
-                                            SIG_SCHEME_WEBAUTHN,
-                                            &pubkey,
-                                        );
-                                    }
-                                    Err(e) => return Err(e),
-                                }
-                            }
+                        let (auth_data, cd_tail) = msg_bytes.split_at(msg_bytes.len() - 32);
+                        let cd_hash_in_msg: &[u8; 32] =
+                            cd_tail.try_into().expect("range guard ensures 32-byte tail");
+                        if (0..sidecar_count).any(|s| &cd_hashes[s] == cd_hash_in_msg) {
+                            webauthn::verify_auth_data(auth_data)?;
+                            match_authority(
+                                authorities,
+                                count,
+                                &mut authority_matched,
+                                &mut matched_count,
+                                SIG_SCHEME_WEBAUTHN,
+                                &pubkey,
+                            );
                         }
                     }
                 }
@@ -415,9 +349,9 @@ fn match_authority(
 /// Unified wallet signature verification.
 ///
 /// Scans the transaction for every scheme-appropriate evidence contribution —
-/// SECP256R1/ED25519 precompile instructions directly, and WEBAUTHN via paired
-/// precompile + ProvideWebAuthnEvidence sidecar (see `verify_threshold_signatures`
-/// for the algorithm).
+/// SECP256R1/ED25519 precompile instructions directly, and WEBAUTHN via
+/// paired precompile + `ProvideWebAuthnEvidenceCompact` sidecar (see
+/// `verify_threshold_signatures` for the algorithm).
 ///
 /// This is the single entry point for every wallet-authorized operation. Future
 /// signature schemes (post-quantum, etc.) extend this by:

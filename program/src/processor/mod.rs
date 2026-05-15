@@ -7,7 +7,6 @@ pub mod create_wallet;
 pub mod execute;
 pub(crate) mod init_pda_account;
 pub mod owner_close_session;
-pub mod provide_webauthn_evidence;
 pub mod remove_authority;
 pub mod revoke_session;
 pub mod self_revoke_session;
@@ -15,13 +14,28 @@ pub mod session_execute;
 pub mod set_threshold;
 
 use solana_program::{
-    account_info::AccountInfo, entrypoint::ProgramResult, program_error::ProgramError,
+    account_info::AccountInfo,
+    entrypoint::ProgramResult,
+    instruction::{get_stack_height, TRANSACTION_LEVEL_STACK_HEIGHT},
+    program_error::ProgramError,
     pubkey::Pubkey,
 };
 
 use crate::error::MachineWalletError;
 use crate::instruction::MachineWalletInstruction;
 use crate::state::MachineWallet;
+
+/// Reject CPI invocation. The stateless `ProvideWebAuthnEvidenceCompact`
+/// sidecar must run at top level so the precompile scanner observes it via
+/// the instructions sysvar; a CPI-invoked sidecar would not be visible to
+/// the consuming wallet instruction.
+#[inline(always)]
+pub(crate) fn reject_cpi_reentry() -> ProgramResult {
+    if get_stack_height() > TRANSACTION_LEVEL_STACK_HEIGHT {
+        return Err(MachineWalletError::CpiReentryDenied.into());
+    }
+    Ok(())
+}
 
 /// Reject any account that isn't the instructions sysvar.
 ///
@@ -152,19 +166,6 @@ pub fn process_instruction(
             session_authority,
             destination,
         ),
-        MachineWalletInstruction::ProvideWebAuthnEvidence {
-            auth_data,
-            client_data_json,
-        } => provide_webauthn_evidence::process(program_id, accounts, auth_data, client_data_json),
-        // Compact sidecar (disc=15): no state change, just rejects CPI invocation
-        // to match precompile placement requirements. The threshold scanner reads
-        // challenge + cd_hash directly from the instructions sysvar.
-        MachineWalletInstruction::ProvideWebAuthnEvidenceCompact { .. } => {
-            use solana_program::instruction::{get_stack_height, TRANSACTION_LEVEL_STACK_HEIGHT};
-            if get_stack_height() > TRANSACTION_LEVEL_STACK_HEIGHT {
-                return Err(MachineWalletError::CpiReentryDenied.into());
-            }
-            Ok(())
-        }
+        MachineWalletInstruction::ProvideWebAuthnEvidenceCompact { .. } => reject_cpi_reentry(),
     }
 }
