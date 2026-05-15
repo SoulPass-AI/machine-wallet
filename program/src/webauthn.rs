@@ -29,6 +29,8 @@ const FLAG_USER_PRESENT: u8 = 0x01;
 const FLAG_USER_VERIFIED: u8 = 0x04;
 /// Length of a base64url-no-pad-encoded 32-byte challenge (ceil(32 * 8 / 6) = 43).
 pub const CHALLENGE_B64_LEN: usize = 43;
+/// Maximum clientDataJSON size accepted by the on-chain sidecar parser.
+pub const MAX_CLIENT_DATA_JSON_SIZE: usize = 1024;
 
 /// Base64url-no-pad encoding of a 32-byte operation hash for use as the
 /// WebAuthn challenge. Encode once per verification; reuse across sidecars.
@@ -38,7 +40,7 @@ pub fn encode_challenge(challenge: &[u8; 32]) -> [u8; CHALLENGE_B64_LEN] {
 
 /// Verify authenticatorData length, rpIdHash, and UP/UV flags. The threshold
 /// scanner calls this on the auth_data prefix it reads directly from the
-/// secp256r1 precompile message (the compact-evidence path).
+/// secp256r1 precompile message.
 pub fn verify_auth_data(auth_data: &[u8]) -> Result<(), ProgramError> {
     if auth_data.len() < MIN_AUTH_DATA_SIZE || auth_data.len() > MAX_AUTH_DATA_SIZE {
         return Err(MachineWalletError::InvalidWebAuthnAuthData.into());
@@ -61,6 +63,34 @@ pub fn verify_auth_data(auth_data: &[u8]) -> Result<(), ProgramError> {
         return Err(MachineWalletError::WebAuthnUserNotVerified.into());
     }
     Ok(())
+}
+
+/// Verify clientDataJSON type/challenge and return its SHA-256 digest.
+///
+/// The sidecar carries clientDataJSON, while the secp256r1 precompile message
+/// carries only SHA256(clientDataJSON). Re-hashing here cryptographically binds
+/// the parsed challenge to the exact bytes signed by the authenticator.
+pub fn verify_client_data_json(
+    client_data_json: &[u8],
+    expected_challenge_b64: &[u8; CHALLENGE_B64_LEN],
+) -> Result<[u8; 32], ProgramError> {
+    if client_data_json.is_empty() || client_data_json.len() > MAX_CLIENT_DATA_JSON_SIZE {
+        return Err(MachineWalletError::InvalidWebAuthnClientDataJson.into());
+    }
+
+    let (auth_type, challenge) = extract_type_and_challenge(client_data_json)?
+        .ok_or(MachineWalletError::InvalidWebAuthnClientDataJson)?;
+    if auth_type != b"webauthn.get" {
+        return Err(MachineWalletError::WebAuthnInvalidType.into());
+    }
+    if challenge != expected_challenge_b64 {
+        return Err(MachineWalletError::WebAuthnChallengeMismatch.into());
+    }
+
+    Ok(solana_program::hash::hashv(&[client_data_json])
+        .as_ref()
+        .try_into()
+        .expect("SHA-256 hash is 32 bytes"))
 }
 
 /// Base64url encode without padding (RFC 4648 section 5).
@@ -92,6 +122,246 @@ fn base64url_encode_no_pad(data: &[u8; 32]) -> [u8; CHALLENGE_B64_LEN] {
     out[oi + 2] = TABLE[(b1 << 2) & 0x3F];
 
     out
+}
+
+/// Extract top-level "type" and "challenge" string fields from clientDataJSON.
+///
+/// Canonical policy: keys and wanted values reject backslash escapes, so a
+/// byte-equal challenge comparison cannot be confused by alternate JSON
+/// spellings. Other fields are skipped with string-escape awareness.
+fn extract_type_and_challenge(json: &[u8]) -> Result<Option<(&[u8], &[u8])>, ProgramError> {
+    let err = || ProgramError::from(MachineWalletError::InvalidWebAuthnClientDataJson);
+
+    let mut cursor = 0;
+    skip_ws(json, &mut cursor);
+    if cursor >= json.len() || json[cursor] != b'{' {
+        return Err(err());
+    }
+    cursor += 1;
+
+    let mut auth_type: Option<&[u8]> = None;
+    let mut challenge: Option<&[u8]> = None;
+
+    loop {
+        skip_ws(json, &mut cursor);
+        if cursor >= json.len() {
+            return Err(err());
+        }
+        if json[cursor] == b'}' {
+            cursor += 1;
+            skip_ws(json, &mut cursor);
+            if cursor != json.len() {
+                return Err(err());
+            }
+            break;
+        }
+
+        let (key, next) = read_canonical_string(json, cursor)?;
+        cursor = next;
+        skip_ws(json, &mut cursor);
+        if cursor >= json.len() || json[cursor] != b':' {
+            return Err(err());
+        }
+        cursor += 1;
+        skip_ws(json, &mut cursor);
+        if cursor >= json.len() {
+            return Err(err());
+        }
+
+        let want = matches!(key, b"type" | b"challenge");
+        if want {
+            let (value, next) = read_canonical_string(json, cursor)?;
+            let slot = if key == b"type" {
+                &mut auth_type
+            } else {
+                &mut challenge
+            };
+            if slot.is_some() {
+                return Err(MachineWalletError::WebAuthnDuplicateField.into());
+            }
+            *slot = Some(value);
+            cursor = next;
+        } else {
+            cursor = skip_json_value(json, cursor)?;
+        }
+
+        skip_ws(json, &mut cursor);
+        if cursor >= json.len() {
+            return Err(err());
+        }
+        match json[cursor] {
+            b',' => {
+                cursor += 1;
+            }
+            b'}' => {
+                cursor += 1;
+                skip_ws(json, &mut cursor);
+                if cursor != json.len() {
+                    return Err(err());
+                }
+                break;
+            }
+            _ => return Err(err()),
+        }
+    }
+
+    Ok(match (auth_type, challenge) {
+        (Some(t), Some(c)) => Some((t, c)),
+        _ => None,
+    })
+}
+
+fn skip_ws(json: &[u8], cursor: &mut usize) {
+    while *cursor < json.len() && json[*cursor].is_ascii_whitespace() {
+        *cursor += 1;
+    }
+}
+
+fn read_canonical_string(json: &[u8], cursor: usize) -> Result<(&[u8], usize), ProgramError> {
+    let err = || ProgramError::from(MachineWalletError::InvalidWebAuthnClientDataJson);
+    if cursor >= json.len() || json[cursor] != b'"' {
+        return Err(err());
+    }
+    let value_start = cursor + 1;
+    let mut value_end = value_start;
+    while value_end < json.len() {
+        let b = json[value_end];
+        if b == b'"' {
+            return Ok((&json[value_start..value_end], value_end + 1));
+        }
+        if b == b'\\' {
+            return Err(err());
+        }
+        value_end += 1;
+    }
+    Err(err())
+}
+
+fn skip_json_value(json: &[u8], mut cursor: usize) -> Result<usize, ProgramError> {
+    let err = || ProgramError::from(MachineWalletError::InvalidWebAuthnClientDataJson);
+    skip_ws(json, &mut cursor);
+    if cursor >= json.len() {
+        return Err(err());
+    }
+
+    match json[cursor] {
+        b'"' => skip_string_body(json, cursor),
+        b'{' | b'[' => skip_json_container(json, cursor),
+        b't' if json.get(cursor..cursor + 4) == Some(b"true") => Ok(cursor + 4),
+        b'f' if json.get(cursor..cursor + 5) == Some(b"false") => Ok(cursor + 5),
+        b'n' if json.get(cursor..cursor + 4) == Some(b"null") => Ok(cursor + 4),
+        b'-' | b'0'..=b'9' => skip_json_number(json, cursor),
+        _ => Err(err()),
+    }
+}
+
+fn skip_json_container(json: &[u8], mut cursor: usize) -> Result<usize, ProgramError> {
+    let err = || ProgramError::from(MachineWalletError::InvalidWebAuthnClientDataJson);
+    let mut stack = [0u8; 16];
+    let mut depth = 0usize;
+
+    loop {
+        if cursor >= json.len() {
+            return Err(err());
+        }
+        match json[cursor] {
+            b'"' => cursor = skip_string_body(json, cursor)?,
+            b'{' => {
+                if depth >= stack.len() {
+                    return Err(err());
+                }
+                stack[depth] = b'}';
+                depth += 1;
+                cursor += 1;
+            }
+            b'[' => {
+                if depth >= stack.len() {
+                    return Err(err());
+                }
+                stack[depth] = b']';
+                depth += 1;
+                cursor += 1;
+            }
+            b'}' | b']' => {
+                if depth == 0 || json[cursor] != stack[depth - 1] {
+                    return Err(err());
+                }
+                depth -= 1;
+                cursor += 1;
+                if depth == 0 {
+                    return Ok(cursor);
+                }
+            }
+            _ => cursor += 1,
+        }
+    }
+}
+
+fn skip_json_number(json: &[u8], mut cursor: usize) -> Result<usize, ProgramError> {
+    let err = || ProgramError::from(MachineWalletError::InvalidWebAuthnClientDataJson);
+    if json[cursor] == b'-' {
+        cursor += 1;
+    }
+    if cursor >= json.len() {
+        return Err(err());
+    }
+    match json[cursor] {
+        b'0' => cursor += 1,
+        b'1'..=b'9' => {
+            cursor += 1;
+            while cursor < json.len() && json[cursor].is_ascii_digit() {
+                cursor += 1;
+            }
+        }
+        _ => return Err(err()),
+    }
+
+    if cursor < json.len() && json[cursor] == b'.' {
+        cursor += 1;
+        let frac_start = cursor;
+        while cursor < json.len() && json[cursor].is_ascii_digit() {
+            cursor += 1;
+        }
+        if cursor == frac_start {
+            return Err(err());
+        }
+    }
+
+    if cursor < json.len() && matches!(json[cursor], b'e' | b'E') {
+        cursor += 1;
+        if cursor < json.len() && matches!(json[cursor], b'+' | b'-') {
+            cursor += 1;
+        }
+        let exp_start = cursor;
+        while cursor < json.len() && json[cursor].is_ascii_digit() {
+            cursor += 1;
+        }
+        if cursor == exp_start {
+            return Err(err());
+        }
+    }
+    Ok(cursor)
+}
+
+fn skip_string_body(json: &[u8], mut cursor: usize) -> Result<usize, ProgramError> {
+    let err = || ProgramError::from(MachineWalletError::InvalidWebAuthnClientDataJson);
+    debug_assert!(cursor < json.len() && json[cursor] == b'"');
+    cursor += 1;
+    while cursor < json.len() {
+        let b = json[cursor];
+        if b == b'"' {
+            return Ok(cursor + 1);
+        }
+        if b == b'\\' {
+            if cursor + 1 >= json.len() {
+                return Err(err());
+            }
+            cursor += 2;
+            continue;
+        }
+        cursor += 1;
+    }
+    Err(err())
 }
 
 #[cfg(test)]
@@ -185,6 +455,115 @@ mod tests {
         auth_data[..32].copy_from_slice(&EXPECTED_RP_ID_HASH);
         auth_data[AUTH_DATA_FLAGS_OFFSET] = FLAG_USER_PRESENT | FLAG_USER_VERIFIED;
         assert!(verify_auth_data(&auth_data).is_ok());
+    }
+
+    fn client_data_for(challenge: &[u8; 32]) -> String {
+        let b64 = encode_challenge(challenge);
+        let challenge = core::str::from_utf8(&b64).unwrap();
+        format!(r#"{{"type":"webauthn.get","challenge":"{}"}}"#, challenge)
+    }
+
+    #[test]
+    fn test_verify_client_data_json_returns_signed_hash() {
+        let challenge = [0x42u8; 32];
+        let client_data = client_data_for(&challenge);
+        let expected = hashv(&[client_data.as_bytes()]).to_bytes();
+        let actual =
+            verify_client_data_json(client_data.as_bytes(), &encode_challenge(&challenge)).unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_verify_client_data_json_rejects_wrong_challenge() {
+        let signed_challenge = [0x42u8; 32];
+        let attempted_operation = [0x43u8; 32];
+        let client_data = client_data_for(&signed_challenge);
+        let err = verify_client_data_json(
+            client_data.as_bytes(),
+            &encode_challenge(&attempted_operation),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            ProgramError::Custom(MachineWalletError::WebAuthnChallengeMismatch as u32)
+        );
+    }
+
+    #[test]
+    fn test_verify_client_data_json_rejects_wrong_type() {
+        let challenge = [0x42u8; 32];
+        let b64 = encode_challenge(&challenge);
+        let challenge_str = core::str::from_utf8(&b64).unwrap();
+        let client_data = format!(
+            r#"{{"type":"webauthn.create","challenge":"{}"}}"#,
+            challenge_str
+        );
+        let err = verify_client_data_json(client_data.as_bytes(), &encode_challenge(&challenge))
+            .unwrap_err();
+        assert_eq!(
+            err,
+            ProgramError::Custom(MachineWalletError::WebAuthnInvalidType as u32)
+        );
+    }
+
+    #[test]
+    fn test_verify_client_data_json_rejects_duplicate_after_valid_fields() {
+        let challenge = [0x42u8; 32];
+        let b64 = encode_challenge(&challenge);
+        let challenge_str = core::str::from_utf8(&b64).unwrap();
+        let client_data = format!(
+            r#"{{"type":"webauthn.get","challenge":"{}","challenge":"evil"}}"#,
+            challenge_str
+        );
+        let err = verify_client_data_json(client_data.as_bytes(), &encode_challenge(&challenge))
+            .unwrap_err();
+        assert_eq!(
+            err,
+            ProgramError::Custom(MachineWalletError::WebAuthnDuplicateField as u32)
+        );
+    }
+
+    #[test]
+    fn test_verify_client_data_json_accepts_extra_fields() {
+        let challenge = [0x42u8; 32];
+        let b64 = encode_challenge(&challenge);
+        let challenge_str = core::str::from_utf8(&b64).unwrap();
+        let client_data = format!(
+            r#"{{"type":"webauthn.get","challenge":"{}","origin":"https://soulpass.ai","crossOrigin":false}}"#,
+            challenge_str
+        );
+        assert!(
+            verify_client_data_json(client_data.as_bytes(), &encode_challenge(&challenge)).is_ok()
+        );
+    }
+
+    #[test]
+    fn test_verify_client_data_json_rejects_missing_comma() {
+        let challenge = [0x42u8; 32];
+        let b64 = encode_challenge(&challenge);
+        let challenge_str = core::str::from_utf8(&b64).unwrap();
+        let client_data = format!(
+            r#"{{"type":"webauthn.get" "challenge":"{}"}}"#,
+            challenge_str
+        );
+        let err = verify_client_data_json(client_data.as_bytes(), &encode_challenge(&challenge))
+            .unwrap_err();
+        assert_eq!(
+            err,
+            ProgramError::Custom(MachineWalletError::InvalidWebAuthnClientDataJson as u32)
+        );
+    }
+
+    #[test]
+    fn test_verify_client_data_json_rejects_trailing_garbage() {
+        let challenge = [0x42u8; 32];
+        let client_data = format!("{} trailing", client_data_for(&challenge));
+        let err = verify_client_data_json(client_data.as_bytes(), &encode_challenge(&challenge))
+            .unwrap_err();
+        assert_eq!(
+            err,
+            ProgramError::Custom(MachineWalletError::InvalidWebAuthnClientDataJson as u32)
+        );
     }
 
     /// The hard-coded EXPECTED_RP_ID_HASH must equal SHA-256(EXPECTED_RP_ID).

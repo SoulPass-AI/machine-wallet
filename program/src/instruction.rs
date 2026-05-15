@@ -2,7 +2,7 @@ use solana_program::program_error::ProgramError;
 
 use crate::error::MachineWalletError;
 use crate::state::MAX_ALLOWED_PROGRAMS;
-use crate::webauthn::CHALLENGE_B64_LEN;
+use crate::webauthn::MAX_CLIENT_DATA_JSON_SIZE;
 
 /// Maximum number of inner instructions in a single Execute call.
 /// Prevents OOM from malicious count values and keeps compute budget reasonable.
@@ -82,10 +82,9 @@ impl InnerInstructionRef<'_> {
 /// - **SECP256R1 / ED25519**: the scheme's precompile instruction (signing the
 ///   32-byte operation hash) is its own evidence — standard Solana flow.
 /// - **WEBAUTHN**: one secp256r1 precompile (signing `auth_data ‖ SHA256(cd)`)
-///   *plus* one `ProvideWebAuthnEvidenceCompact` instruction carrying the
-///   base64url challenge and `SHA256(clientDataJSON)`. The on-chain scanner
-///   matches challenge → operation, then verifies auth_data directly from the
-///   precompile message head.
+///   *plus* one `ProvideWebAuthnEvidence` instruction carrying `clientDataJSON`.
+///   The on-chain scanner parses challenge/type, hashes the JSON, then verifies
+///   auth_data directly from the precompile message head.
 ///
 /// This symmetry means an M-of-N wallet can combine arbitrarily many signers
 /// of arbitrary schemes in one transaction — each signer contributes an
@@ -106,11 +105,11 @@ impl InnerInstructionRef<'_> {
 /// - RemoveAuthority: [10] + remove_sig_scheme (u8) + remove_pubkey (33) + new_threshold (u8) + max_slot (u64 LE)
 /// - SetThreshold:    [11] + new_threshold (u8) + max_slot (u64 LE)
 /// - OwnerCloseSession: [12] + max_slot (u64 LE) + session_authority (32) + destination (32)
-/// - ProvideWebAuthnEvidenceCompact: [15] + challenge (43 bytes) + cd_hash (32 bytes)
+/// - ProvideWebAuthnEvidence: [15] + client_data_json_len (u16 LE) + client_data_json
 ///   Sidecar instruction — no state change. Its presence in the tx makes the
-///   challenge + cd_hash available to every wallet instruction in the same tx
-///   for WEBAUTHN-scheme threshold contribution. auth_data is read directly
-///   from the paired secp256r1 precompile message by the threshold scanner.
+///   clientDataJSON available to every wallet instruction in the same tx for
+///   WEBAUTHN-scheme threshold contribution. auth_data is read directly from
+///   the paired secp256r1 precompile message by the threshold scanner.
 ///
 /// Inner instruction wire format:
 ///   program_id (32) + accounts_len (u16 LE) + data_len (u16 LE) + accounts (accounts_len * 2 bytes: index + flags) + data
@@ -191,10 +190,7 @@ pub enum MachineWalletInstruction<'a> {
     },
 
     /// Change the threshold without adding/removing authorities.
-    SetThreshold {
-        new_threshold: u8,
-        max_slot: u64,
-    },
+    SetThreshold { new_threshold: u8, max_slot: u64 },
 
     /// Wallet-owner path to close a revoked or expired session and reclaim rent.
     OwnerCloseSession {
@@ -203,8 +199,7 @@ pub enum MachineWalletInstruction<'a> {
         destination: [u8; 32],
     },
 
-    /// Sidecar instruction carrying a WebAuthn passkey assertion's challenge
-    /// binding (base64url operation_hash) and `SHA256(clientDataJSON)`.
+    /// Sidecar instruction carrying WebAuthn clientDataJSON.
     ///
     /// This instruction does NOT mutate any state. Its only purpose is to live in
     /// the tx's instruction list so that `threshold::verify_threshold_signatures`
@@ -213,15 +208,9 @@ pub enum MachineWalletInstruction<'a> {
     ///
     /// `auth_data` is not carried here — the scanner reads it from the paired
     /// secp256r1 precompile message and verifies rpIdHash + UP/UV directly.
-    /// Trade-off: clientDataJSON.type (`"webauthn.get"`) is not validated
-    /// on-chain; the client's WebAuthn library must produce a get-ceremony
-    /// assertion. The challenge field binds the assertion to this specific
-    /// operation_hash, so cross-ceremony replay would still need the user to
-    /// approve a passkey prompt for the exact hash.
-    ProvideWebAuthnEvidenceCompact {
-        challenge: [u8; CHALLENGE_B64_LEN],
-        cd_hash: [u8; CD_HASH_LEN],
-    },
+    /// The JSON is re-hashed on-chain and compared to the precompile tail, so
+    /// the parsed challenge is bound to the exact bytes signed by WebAuthn.
+    ProvideWebAuthnEvidence { client_data_json: &'a [u8] },
 }
 
 /// Parse inner instructions from a byte slice starting at the count field.
@@ -509,8 +498,8 @@ impl<'a> MachineWalletInstruction<'a> {
             }
 
             15 => {
-                let (challenge, cd_hash) = parse_webauthn_evidence_compact_payload(rest)?;
-                Ok(Self::ProvideWebAuthnEvidenceCompact { challenge, cd_hash })
+                let client_data_json = parse_webauthn_evidence_payload(rest)?;
+                Ok(Self::ProvideWebAuthnEvidence { client_data_json })
             }
 
             _ => Err(ProgramError::InvalidInstructionData),
@@ -518,33 +507,31 @@ impl<'a> MachineWalletInstruction<'a> {
     }
 }
 
-/// Discriminator for `ProvideWebAuthnEvidenceCompact`. Exposed so the threshold
-/// scanner can recognize compact sidecar instructions without depending on the
-/// full enum.
-pub const PROVIDE_WEBAUTHN_EVIDENCE_COMPACT_DISCRIMINATOR: u8 = 15;
+/// Discriminator for `ProvideWebAuthnEvidence`. Exposed so the threshold
+/// scanner can recognize sidecar instructions without depending on the full enum.
+pub const PROVIDE_WEBAUTHN_EVIDENCE_DISCRIMINATOR: u8 = 15;
 
-/// Parse a ProvideWebAuthnEvidenceCompact payload (disc=15).
+/// Parse a ProvideWebAuthnEvidence payload (disc=15).
 ///
-/// Wire format (no length prefix, fixed-size):
-///   challenge : [u8; CHALLENGE_B64_LEN]   // base64url_nopad(operation_hash)
-///   cd_hash   : [u8; CD_HASH_LEN]         // sha256(clientDataJSON)
-pub(crate) fn parse_webauthn_evidence_compact_payload(
-    data: &[u8],
-) -> Result<([u8; CHALLENGE_B64_LEN], [u8; CD_HASH_LEN]), ProgramError> {
-    if data.len() != COMPACT_EVIDENCE_PAYLOAD_LEN {
+/// Wire format:
+///   client_data_json_len : u16 LE
+///   client_data_json     : client_data_json_len bytes
+pub(crate) fn parse_webauthn_evidence_payload(data: &[u8]) -> Result<&[u8], ProgramError> {
+    if data.len() < 2 {
         return Err(ProgramError::InvalidInstructionData);
     }
-    let mut challenge = [0u8; CHALLENGE_B64_LEN];
-    challenge.copy_from_slice(&data[..CHALLENGE_B64_LEN]);
-    let mut cd_hash = [0u8; CD_HASH_LEN];
-    cd_hash.copy_from_slice(&data[CHALLENGE_B64_LEN..]);
-    Ok((challenge, cd_hash))
+    let len = u16::from_le_bytes([data[0], data[1]]) as usize;
+    if len == 0 || len > MAX_CLIENT_DATA_JSON_SIZE {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let end = 2usize
+        .checked_add(len)
+        .ok_or(ProgramError::InvalidInstructionData)?;
+    if end != data.len() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    Ok(&data[2..end])
 }
-
-/// SHA-256 digest length in bytes.
-pub const CD_HASH_LEN: usize = 32;
-/// Total payload length for the disc=15 compact sidecar (challenge + cd_hash).
-pub const COMPACT_EVIDENCE_PAYLOAD_LEN: usize = CHALLENGE_B64_LEN + CD_HASH_LEN;
 
 #[cfg(test)]
 mod tests {
@@ -1251,8 +1238,8 @@ mod tests {
     }
 
     /// Discriminator 13 is unknown and must be rejected. Disc=14 was the
-    /// legacy `ProvideWebAuthnEvidence` slot — removed in favor of disc=15
-    /// (compact). It must now also fail closed.
+    /// legacy full `authData + clientDataJSON` slot — removed in favor of
+    /// disc=15, which carries only clientDataJSON.
     #[test]
     fn test_disc_13_and_14_rejected() {
         for disc in [13u8, 14u8] {
@@ -1262,88 +1249,75 @@ mod tests {
         }
     }
 
-    // ─── ProvideWebAuthnEvidenceCompact (disc=15) parsing ─────────────────────
+    // ─── ProvideWebAuthnEvidence (disc=15) parsing ───────────────────────────
 
-    fn build_compact_sidecar_data(
-        challenge: &[u8; CHALLENGE_B64_LEN],
-        cd_hash: &[u8; CD_HASH_LEN],
-    ) -> Vec<u8> {
-        let mut data = vec![PROVIDE_WEBAUTHN_EVIDENCE_COMPACT_DISCRIMINATOR];
-        data.extend_from_slice(challenge);
-        data.extend_from_slice(cd_hash);
+    fn build_sidecar_data(client_data_json: &[u8]) -> Vec<u8> {
+        let mut data = vec![PROVIDE_WEBAUTHN_EVIDENCE_DISCRIMINATOR];
+        data.extend_from_slice(&(client_data_json.len() as u16).to_le_bytes());
+        data.extend_from_slice(client_data_json);
         data
     }
 
     #[test]
-    fn test_parse_compact_sidecar_valid() {
-        let challenge = [0x41u8; CHALLENGE_B64_LEN];
-        let cd_hash = [0xBBu8; CD_HASH_LEN];
-        let data = build_compact_sidecar_data(&challenge, &cd_hash);
-        assert_eq!(data.len(), 1 + COMPACT_EVIDENCE_PAYLOAD_LEN);
-
+    fn test_parse_webauthn_sidecar_valid() {
+        let client_data_json = br#"{"type":"webauthn.get","challenge":"abc"}"#;
+        let data = build_sidecar_data(client_data_json);
         let ix = MachineWalletInstruction::unpack(&data).unwrap();
         match ix {
-            MachineWalletInstruction::ProvideWebAuthnEvidenceCompact {
-                challenge: c,
-                cd_hash: h,
+            MachineWalletInstruction::ProvideWebAuthnEvidence {
+                client_data_json: c,
             } => {
-                assert_eq!(c, challenge);
-                assert_eq!(h, cd_hash);
+                assert_eq!(c, client_data_json);
             }
-            _ => panic!("Expected ProvideWebAuthnEvidenceCompact"),
+            _ => panic!("Expected ProvideWebAuthnEvidence"),
         }
     }
 
     #[test]
-    fn test_compact_sidecar_discriminator_constant() {
-        assert_eq!(PROVIDE_WEBAUTHN_EVIDENCE_COMPACT_DISCRIMINATOR, 15);
+    fn test_webauthn_sidecar_discriminator_constant() {
+        assert_eq!(PROVIDE_WEBAUTHN_EVIDENCE_DISCRIMINATOR, 15);
     }
 
     #[test]
-    fn test_compact_sidecar_empty_payload_rejected() {
+    fn test_webauthn_sidecar_empty_payload_rejected() {
         let data = vec![15u8]; // discriminator only — no payload
         let err = MachineWalletInstruction::unpack(&data).unwrap_err();
         assert_eq!(err, ProgramError::InvalidInstructionData);
     }
 
     #[test]
-    fn test_compact_sidecar_truncated_payload_rejected() {
-        // challenge only — missing cd_hash
-        let mut data = vec![PROVIDE_WEBAUTHN_EVIDENCE_COMPACT_DISCRIMINATOR];
-        data.extend_from_slice(&[0x41u8; CHALLENGE_B64_LEN]);
+    fn test_webauthn_sidecar_declared_len_missing_bytes_rejected() {
+        let mut data = vec![PROVIDE_WEBAUTHN_EVIDENCE_DISCRIMINATOR];
+        data.extend_from_slice(&5u16.to_le_bytes());
+        data.extend_from_slice(b"abc");
         let err = MachineWalletInstruction::unpack(&data).unwrap_err();
         assert_eq!(err, ProgramError::InvalidInstructionData);
     }
 
     #[test]
-    fn test_compact_sidecar_trailing_byte_rejected() {
-        let challenge = [0x41u8; CHALLENGE_B64_LEN];
-        let cd_hash = [0xBBu8; CD_HASH_LEN];
-        let mut data = build_compact_sidecar_data(&challenge, &cd_hash);
+    fn test_webauthn_sidecar_trailing_byte_rejected() {
+        let mut data = build_sidecar_data(b"{}");
         data.push(0xFF);
         let err = MachineWalletInstruction::unpack(&data).unwrap_err();
         assert_eq!(err, ProgramError::InvalidInstructionData);
     }
 
     #[test]
-    fn test_compact_sidecar_one_byte_short_rejected() {
-        let mut data = vec![PROVIDE_WEBAUTHN_EVIDENCE_COMPACT_DISCRIMINATOR];
-        data.extend_from_slice(&[0u8; COMPACT_EVIDENCE_PAYLOAD_LEN - 1]);
+    fn test_webauthn_sidecar_zero_len_rejected() {
+        let mut data = vec![PROVIDE_WEBAUTHN_EVIDENCE_DISCRIMINATOR];
+        data.extend_from_slice(&0u16.to_le_bytes());
         let err = MachineWalletInstruction::unpack(&data).unwrap_err();
         assert_eq!(err, ProgramError::InvalidInstructionData);
     }
 
     #[test]
-    fn test_parse_compact_sidecar_all_zeros() {
-        // Zero-value challenge and cd_hash — structurally valid (semantic check
-        // is in the threshold scanner, not the parser).
-        let challenge = [0u8; CHALLENGE_B64_LEN];
-        let cd_hash = [0u8; CD_HASH_LEN];
-        let data = build_compact_sidecar_data(&challenge, &cd_hash);
+    fn test_webauthn_sidecar_max_len_accepted() {
+        let client_data_json = vec![b'a'; MAX_CLIENT_DATA_JSON_SIZE];
+        let data = build_sidecar_data(&client_data_json);
         let ix = MachineWalletInstruction::unpack(&data).unwrap();
         assert!(matches!(
             ix,
-            MachineWalletInstruction::ProvideWebAuthnEvidenceCompact { .. }
+            MachineWalletInstruction::ProvideWebAuthnEvidence { .. }
         ));
     }
 }

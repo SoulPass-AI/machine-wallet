@@ -25,7 +25,7 @@ use crate::error::MachineWalletError;
 use crate::instruction::MachineWalletInstruction;
 use crate::state::MachineWallet;
 
-/// Reject CPI invocation. The stateless `ProvideWebAuthnEvidenceCompact`
+/// Reject CPI invocation. The stateless `ProvideWebAuthnEvidence`
 /// sidecar must run at top level so the precompile scanner observes it via
 /// the instructions sysvar; a CPI-invoked sidecar would not be visible to
 /// the consuming wallet instruction.
@@ -166,6 +166,6 @@ pub fn process_instruction(
             session_authority,
             destination,
         ),
-        MachineWalletInstruction::ProvideWebAuthnEvidenceCompact { .. } => reject_cpi_reentry(),
+        MachineWalletInstruction::ProvideWebAuthnEvidence { .. } => reject_cpi_reentry(),
     }
 }

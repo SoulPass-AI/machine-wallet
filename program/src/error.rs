@@ -125,10 +125,9 @@ impl std::fmt::Display for MachineWalletError {
             Self::SessionSpendCapExceeded => {
                 write!(f, "Session cumulative spend cap exceeded")
             }
-            Self::TooManyWebAuthnEvidence => write!(
-                f,
-                "Too many ProvideWebAuthnEvidenceCompact sidecar instructions"
-            ),
+            Self::TooManyWebAuthnEvidence => {
+                write!(f, "Too many ProvideWebAuthnEvidence sidecar instructions")
+            }
         }
     }
 }

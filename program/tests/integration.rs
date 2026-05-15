@@ -2621,11 +2621,7 @@ fn test_inner_hash_order_matters() {
 }
 
 /// Build an AdvanceNonce instruction.
-fn build_advance_nonce_ix(
-    fee_payer: &Pubkey,
-    wallet_pda: &Pubkey,
-    max_slot: u64,
-) -> Instruction {
+fn build_advance_nonce_ix(fee_payer: &Pubkey, wallet_pda: &Pubkey, max_slot: u64) -> Instruction {
     let mut data = vec![3u8];
     data.extend_from_slice(&max_slot.to_le_bytes());
     Instruction {
@@ -3474,14 +3470,7 @@ async fn test_add_authority_duplicate_rejected() {
     let tx = Transaction::new_signed_with_payer(
         &[
             build_ed25519_precompile_ix(&owner, &msg),
-            build_add_authority_ix(
-                &payer.pubkey(),
-                &wallet_pda,
-                1,
-                &owner_bytes,
-                0,
-                u64::MAX,
-            ),
+            build_add_authority_ix(&payer.pubkey(), &wallet_pda, 1, &owner_bytes, 0, u64::MAX),
         ],
         Some(&payer.pubkey()),
         &[&payer],
@@ -3588,14 +3577,7 @@ async fn test_remove_authority_last_rejected() {
     let tx = Transaction::new_signed_with_payer(
         &[
             build_ed25519_precompile_ix(&owner, &msg),
-            build_remove_authority_ix(
-                &payer.pubkey(),
-                &wallet_pda,
-                1,
-                &owner_bytes,
-                0,
-                u64::MAX,
-            ),
+            build_remove_authority_ix(&payer.pubkey(), &wallet_pda, 1, &owner_bytes, 0, u64::MAX),
         ],
         Some(&payer.pubkey()),
         &[&payer],
@@ -4754,18 +4736,13 @@ fn build_secp256r1_ix_variable(
     }
 }
 
-/// Build a `ProvideWebAuthnEvidenceCompact` sidecar instruction (discriminator 15).
-/// Place one per passkey contribution in the tx — each paired with a separate
-/// secp256r1 precompile signing `auth_data ‖ SHA256(cd)`.
-fn build_provide_webauthn_evidence_compact_ix(
-    op_hash: &[u8; 32],
-    client_data_json: &[u8],
-) -> Instruction {
-    let challenge_b64 = passkey_base64url_no_pad(op_hash);
-    let cd_hash = solana_sdk::hash::hash(client_data_json).to_bytes();
+/// Build a `ProvideWebAuthnEvidence` sidecar instruction (discriminator 15).
+/// It carries clientDataJSON only; authData is read from the paired secp256r1
+/// precompile message, whose tail must equal SHA256(clientDataJSON).
+fn build_provide_webauthn_evidence_ix(client_data_json: &[u8]) -> Instruction {
     let mut data = vec![15u8];
-    data.extend_from_slice(challenge_b64.as_bytes()); // 43 bytes
-    data.extend_from_slice(&cd_hash); // 32 bytes
+    data.extend_from_slice(&(client_data_json.len() as u16).to_le_bytes());
+    data.extend_from_slice(client_data_json);
     Instruction {
         program_id: machine_wallet::id(),
         accounts: vec![],
@@ -4794,8 +4771,7 @@ async fn create_webauthn_wallet_helper(
     let client_data_json = passkey_client_data_json(&create_msg);
     let wa_msg = passkey_signed_message(&auth_data, client_data_json.as_bytes());
     let proof_ix = build_secp256r1_ix_variable(&signing_key, &compressed, &wa_msg);
-    let sidecar_ix =
-        build_provide_webauthn_evidence_compact_ix(&create_msg, client_data_json.as_bytes());
+    let sidecar_ix = build_provide_webauthn_evidence_ix(client_data_json.as_bytes());
     let tx = Transaction::new_signed_with_payer(
         &[proof_ix, sidecar_ix, create_ix],
         Some(&payer.pubkey()),
@@ -4815,7 +4791,7 @@ fn contains_custom_err(err: &dyn std::fmt::Debug, code: u32) -> bool {
 
 // --- tests that do NOT require secp256r1 precompile support -----------------
 
-/// Threshold enforcement: an Execute carrying a compact sidecar but no
+/// Threshold enforcement: an Execute carrying a WebAuthn sidecar but no
 /// matching secp256r1 precompile must fail — the sidecar alone provides zero
 /// authority contribution; only the pairing with a precompile that signs
 /// `auth_data ‖ SHA256(cd)` counts toward the threshold.
@@ -4853,8 +4829,7 @@ async fn test_execute_webauthn_no_precompile_rejected() {
 
     // Sidecar present but no matching secp256r1 precompile → WEBAUTHN authority
     // contributes 0, threshold missed.
-    let sidecar_ix =
-        build_provide_webauthn_evidence_compact_ix(&execute_hash, client_data.as_bytes());
+    let sidecar_ix = build_provide_webauthn_evidence_ix(client_data.as_bytes());
     let exec_ix = build_execute_ix(
         &payer.pubkey(),
         &wallet_pda,
@@ -4923,8 +4898,7 @@ async fn test_execute_webauthn_rejects_uv_clear() {
     let wa_msg = passkey_signed_message(&auth_data, client_data.as_bytes());
     let precompile_ix = build_secp256r1_ix_variable(&signing_key, &compressed, &wa_msg);
 
-    let sidecar_ix =
-        build_provide_webauthn_evidence_compact_ix(&execute_hash, client_data.as_bytes());
+    let sidecar_ix = build_provide_webauthn_evidence_ix(client_data.as_bytes());
     let exec_ix = build_execute_ix(
         &payer.pubkey(),
         &wallet_pda,
@@ -5009,8 +4983,7 @@ async fn test_execute_webauthn_happy_path() {
     let wa_msg = passkey_signed_message(&auth_data, client_data.as_bytes());
     let precompile_ix = build_secp256r1_ix_variable(&signing_key, &compressed, &wa_msg);
 
-    let sidecar_ix =
-        build_provide_webauthn_evidence_compact_ix(&execute_hash, client_data.as_bytes());
+    let sidecar_ix = build_provide_webauthn_evidence_ix(client_data.as_bytes());
     let exec_ix = build_execute_ix(
         &payer.pubkey(),
         &wallet_pda,
@@ -5136,8 +5109,7 @@ async fn test_execute_webauthn_threshold_bypass_rejected() {
     let wa_msg = passkey_signed_message(&auth_data, client_data.as_bytes());
     let precompile_ix = build_secp256r1_ix_variable(&wa_signing_key, &wa_pubkey, &wa_msg);
 
-    let sidecar_ix =
-        build_provide_webauthn_evidence_compact_ix(&execute_hash, client_data.as_bytes());
+    let sidecar_ix = build_provide_webauthn_evidence_ix(client_data.as_bytes());
     let exec_ix = build_execute_ix(
         &payer.pubkey(),
         &wallet_pda,
@@ -5282,8 +5254,7 @@ async fn test_execute_webauthn_mixed_sig_threshold_met() {
     let ed_precompile = build_ed25519_precompile_ix(&owner, &execute_hash);
     let wa_precompile = build_secp256r1_ix_variable(&wa_signing_key, &wa_pubkey, &wa_msg);
 
-    let sidecar_ix =
-        build_provide_webauthn_evidence_compact_ix(&execute_hash, client_data.as_bytes());
+    let sidecar_ix = build_provide_webauthn_evidence_ix(client_data.as_bytes());
     let exec_ix = build_execute_ix(
         &payer.pubkey(),
         &wallet_pda,
@@ -5351,8 +5322,7 @@ async fn test_execute_webauthn_expired_max_slot() {
     let wa_msg = passkey_signed_message(&auth_data, client_data.as_bytes());
     let precompile_ix = build_secp256r1_ix_variable(&signing_key, &compressed, &wa_msg);
 
-    let sidecar_ix =
-        build_provide_webauthn_evidence_compact_ix(&execute_hash, client_data.as_bytes());
+    let sidecar_ix = build_provide_webauthn_evidence_ix(client_data.as_bytes());
     let exec_ix = build_execute_ix(
         &payer.pubkey(),
         &wallet_pda,
