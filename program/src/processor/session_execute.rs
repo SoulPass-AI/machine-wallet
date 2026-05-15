@@ -272,22 +272,11 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/src/processor/create_session.rs"
         ));
-        // Exact tokens from the create_session wallet-PDA verification block.
+        // The wallet-PDA check is now centralised in `super::verify_wallet_pda`.
+        // Verify create_session delegates to it rather than open-coding the derivation.
         assert!(
-            src.contains("Pubkey::create_program_address"),
-            "create_session.rs must call create_program_address to PDA-validate wallet"
-        );
-        assert!(
-            src.contains("MachineWallet::SEED_PREFIX"),
-            "create_session.rs must derive the wallet PDA using MachineWallet::SEED_PREFIX"
-        );
-        assert!(
-            src.contains("wallet.bump"),
-            "create_session.rs must use wallet.bump when re-deriving"
-        );
-        assert!(
-            src.contains("InvalidWalletPDA"),
-            "create_session.rs must reject mismatched wallet PDA"
+            src.contains("verify_wallet_pda"),
+            "create_session.rs must call super::verify_wallet_pda to validate the wallet PDA"
         );
     }
 }

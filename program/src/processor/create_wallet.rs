@@ -79,8 +79,7 @@ fn verify_create_authority_proof(
 /// `system_program::transfer` CPI works naturally from Execute. The vault_bump
 /// is computed and cached in wallet state for later `invoke_signed` calls.
 ///
-/// Creates v1 layout directly (version=1, single authority). The account size
-/// for 1 authority (87 bytes) is identical to the old v0 layout.
+/// Creates a single-authority wallet at `MachineWallet::LAYOUT_VERSION`.
 pub fn process(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -164,7 +163,7 @@ pub fn process(
     );
 
     // 10. Initialize wallet PDA in a dust-resistant way.
-    let account_size = MachineWallet::v1_account_size(1);
+    let account_size = MachineWallet::account_size(1);
     let wallet_signer_seeds: &[&[u8]] = &[MachineWallet::SEED_PREFIX, &id, &[wallet_bump]];
     init_pda_account(
         payer,
@@ -176,11 +175,10 @@ pub fn process(
         MachineWalletError::WalletAlreadyInitialized,
     )?;
 
-    // 11. Initialize wallet state as v1 layout (including cached vault_bump)
+    // 11. Initialize wallet state (including cached vault_bump).
     let mut authorities = [AuthoritySlot::EMPTY; MAX_AUTHORITIES as usize];
     authorities[0] = authority_slot;
     let wallet = MachineWallet {
-        version: 1,
         bump: wallet_bump,
         wallet_id: id,
         threshold: 1,
@@ -192,7 +190,7 @@ pub fn process(
     };
 
     let mut data = wallet_account.try_borrow_mut_data()?;
-    wallet.serialize_v1(&mut data)?;
+    wallet.serialize(&mut data)?;
 
     Ok(())
 }

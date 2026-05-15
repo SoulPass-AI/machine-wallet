@@ -62,7 +62,6 @@ pub fn compute_close_message(
 pub fn process(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
-    secp256r1_ix_index: u8,
     max_slot: u64,
     destination_pubkey: [u8; 32],
 ) -> ProgramResult {
@@ -115,16 +114,8 @@ pub fn process(
     let wallet = MachineWallet::deserialize_runtime(&data)?;
     drop(data);
 
-    // 7. Verify wallet PDA using cached bump (id computed from authority, ~100 CU syscall)
-    let id = wallet.id();
-    let expected_wallet_pda = Pubkey::create_program_address(
-        &[MachineWallet::SEED_PREFIX, &id, &[wallet.bump]],
-        program_id,
-    )
-    .map_err(|_| MachineWalletError::InvalidWalletPDA)?;
-    if *wallet_account.key != expected_wallet_pda {
-        return Err(MachineWalletError::InvalidWalletPDA.into());
-    }
+    // 7. Verify wallet PDA using cached bump.
+    super::verify_wallet_pda(wallet_account, &wallet, program_id)?;
 
     // 8. Verify vault PDA using cached vault_bump
     let expected_vault_pda = Pubkey::create_program_address(
@@ -164,7 +155,6 @@ pub fn process(
         instructions_sysvar,
         program_id,
         &wallet,
-        secp256r1_ix_index,
         &expected_message,
     )?;
 
@@ -174,20 +164,10 @@ pub fn process(
     //     so every pre-existing session is killed atomically with the close — a
     //     leaked session key cannot drain residual SPL/NFT assets afterwards.
     //     Wallet state survives so the owner can still recover those assets.
-    let new_nonce = wallet
-        .nonce
-        .checked_add(1)
-        .ok_or(ProgramError::ArithmeticOverflow)?;
-    let new_creation_slot = wallet
-        .creation_slot
-        .checked_add(1)
-        .ok_or(ProgramError::ArithmeticOverflow)?;
     {
         let mut data = wallet_account.try_borrow_mut_data()?;
-        let nonce_off = wallet.nonce_offset();
-        data[nonce_off..nonce_off + 8].copy_from_slice(&new_nonce.to_le_bytes());
-        let cs_off = wallet.creation_slot_offset();
-        data[cs_off..cs_off + 8].copy_from_slice(&new_creation_slot.to_le_bytes());
+        wallet.write_incremented_nonce(&mut data)?;
+        wallet.write_incremented_creation_slot(&mut data)?;
     }
 
     // 13. Drain vault SOL via CPI; vault stays system-owned. SPL/NFT assets
@@ -238,8 +218,8 @@ mod tests {
     fn test_recoverable_close_rent_floor_is_wallet_sized() {
         use solana_program::rent::Rent;
         let rent = Rent::default();
-        let min_wallet_rent = rent.minimum_balance(MachineWallet::LEN);
-        let max_wallet_rent = rent.minimum_balance(MachineWallet::v1_account_size(16));
+        let min_wallet_rent = rent.minimum_balance(MachineWallet::account_size(1));
+        let max_wallet_rent = rent.minimum_balance(MachineWallet::account_size(16));
         assert!(min_wallet_rent > 0);
         assert!(max_wallet_rent >= min_wallet_rent);
     }

@@ -44,7 +44,6 @@ pub fn compute_revoke_session_message(
 pub fn process(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
-    secp256r1_ix_index: u8,
     max_slot: u64,
     session_authority: [u8; 32],
 ) -> ProgramResult {
@@ -92,16 +91,8 @@ pub fn process(
     let wallet = MachineWallet::deserialize_runtime(&data)?;
     drop(data);
 
-    // 5. Verify wallet PDA using cached bump (cheaper than find_program_address)
-    let id = wallet.id();
-    let expected_wallet_pda = Pubkey::create_program_address(
-        &[MachineWallet::SEED_PREFIX, &id, &[wallet.bump]],
-        program_id,
-    )
-    .map_err(|_| MachineWalletError::InvalidWalletPDA)?;
-    if *wallet_account.key != expected_wallet_pda {
-        return Err(MachineWalletError::InvalidWalletPDA.into());
-    }
+    // 5. Verify wallet PDA using cached bump.
+    super::verify_wallet_pda(wallet_account, &wallet, program_id)?;
 
     // 6. Deserialize SessionState — validates it is a real initialized session
     let session_data_borrowed = session_account.try_borrow_data()?;
@@ -152,7 +143,6 @@ pub fn process(
         instructions_sysvar,
         program_id,
         &wallet,
-        secp256r1_ix_index,
         &expected_message,
     )?;
 

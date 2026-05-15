@@ -139,24 +139,22 @@ impl InnerInstructionRef<'_> {
 ///
 /// Wire format:
 /// - CreateWallet:    [0] + max_slot (u64 LE) + sig_scheme (u8) + authority (33 bytes)
-/// - Execute:         [1] + secp256r1_ix_index (u8) + max_slot (u64 LE) + inner_instruction_count (u32 LE) + inner instructions
-/// - CloseWallet:     [2] + secp256r1_ix_index (u8) + max_slot (u64 LE) + destination (32 bytes)
-/// - AdvanceNonce:    [3] + secp256r1_ix_index (u8) + max_slot (u64 LE)
-/// - CreateSession:   [4] + secp256r1_ix_index (u8) + max_slot (u64 LE) + session_authority (32) + expiry_slot (u64 LE) + max_lamports_per_call (u64 LE) + max_total_spent_lamports (u64 LE) + allowed_programs_count (u8) + allowed_programs (count*32)
+/// - Execute:         [1] + max_slot (u64 LE) + inner_instruction_count (u32 LE) + inner instructions
+/// - CloseWallet:     [2] + max_slot (u64 LE) + destination (32 bytes)
+/// - AdvanceNonce:    [3] + max_slot (u64 LE)
+/// - CreateSession:   [4] + max_slot (u64 LE) + session_authority (32) + expiry_slot (u64 LE) + max_lamports_per_call (u64 LE) + max_total_spent_lamports (u64 LE) + allowed_programs_count (u8) + allowed_programs (count*32)
 /// - SessionExecute:  [5] + inner_instruction_count (u32 LE) + inner instructions
-/// - RevokeSession:   [6] + secp256r1_ix_index (u8) + max_slot (u64 LE) + session_authority (32)
+/// - RevokeSession:   [6] + max_slot (u64 LE) + session_authority (32)
 /// - SelfRevokeSession: [7]
 /// - CloseSession:    [8]  — accounts: [session_account, authority (signer), destination]
-/// - AddAuthority:    [9] + precompile_ix_index (u8) + new_sig_scheme (u8) + new_pubkey (33) + new_threshold (u8) + max_slot (u64 LE)
-/// - RemoveAuthority: [10] + precompile_ix_index (u8) + remove_sig_scheme (u8) + remove_pubkey (33) + new_threshold (u8) + max_slot (u64 LE)
-/// - SetThreshold:    [11] + precompile_ix_index (u8) + new_threshold (u8) + max_slot (u64 LE)
-/// - OwnerCloseSession: [12] + precompile_ix_index (u8) + max_slot (u64 LE) + session_authority (32) + destination (32)
+/// - AddAuthority:    [9] + new_sig_scheme (u8) + new_pubkey (33) + new_threshold (u8) + max_slot (u64 LE)
+/// - RemoveAuthority: [10] + remove_sig_scheme (u8) + remove_pubkey (33) + new_threshold (u8) + max_slot (u64 LE)
+/// - SetThreshold:    [11] + new_threshold (u8) + max_slot (u64 LE)
+/// - OwnerCloseSession: [12] + max_slot (u64 LE) + session_authority (32) + destination (32)
 /// - ProvideWebAuthnEvidence: [14] + auth_data_len (u16 LE) + auth_data + client_data_json_len (u16 LE) + client_data_json
 ///   Sidecar instruction — no state change. Its presence in the tx makes the
 ///   carried auth_data / clientDataJSON available to every wallet instruction
 ///   in the same tx for WEBAUTHN-scheme threshold contribution.
-///
-/// Discriminator 13 is reserved.
 ///
 /// Inner instruction wire format:
 ///   program_id (32) + accounts_len (u16 LE) + data_len (u16 LE) + accounts (accounts_len * 2 bytes: index + flags) + data
@@ -171,30 +169,24 @@ pub enum MachineWalletInstruction<'a> {
         authority: [u8; 33],
     },
 
-    /// Execute one or more inner instructions, verified by secp256r1 precompile.
+    /// Execute one or more inner instructions, verified by wallet signatures.
     Execute {
-        secp256r1_ix_index: u8,
         max_slot: u64,
         inner_instructions: Vec<InnerInstructionRef<'a>>,
     },
 
-    /// Close the wallet and reclaim rent, verified by secp256r1 precompile.
+    /// Close the wallet and reclaim rent, verified by wallet signatures.
     /// destination is included in the signed message to prevent relay redirection.
     CloseWallet {
-        secp256r1_ix_index: u8,
         max_slot: u64,
         destination: [u8; 32],
     },
 
     /// Advance nonce without executing anything (cancel a pending signed operation).
-    AdvanceNonce {
-        secp256r1_ix_index: u8,
-        max_slot: u64,
-    },
+    AdvanceNonce { max_slot: u64 },
 
     /// Create a session key, verified by wallet signatures.
     CreateSession {
-        secp256r1_ix_index: u8,
         max_slot: u64,
         session_authority: [u8; 32],
         expiry_slot: u64,
@@ -213,9 +205,8 @@ pub enum MachineWalletInstruction<'a> {
         inner_instructions: Vec<InnerInstructionRef<'a>>,
     },
 
-    /// Revoke a session (owner path, requires secp256r1 precompile).
+    /// Revoke a session (owner path, verified by wallet signatures).
     RevokeSession {
-        secp256r1_ix_index: u8,
         max_slot: u64,
         session_authority: [u8; 32],
     },
@@ -229,7 +220,6 @@ pub enum MachineWalletInstruction<'a> {
 
     /// Add a new authority to the wallet. Reallocs account.
     AddAuthority {
-        precompile_ix_index: u8,
         new_sig_scheme: u8,
         new_pubkey: [u8; 33],
         new_threshold: u8, // 0 = keep current
@@ -238,7 +228,6 @@ pub enum MachineWalletInstruction<'a> {
 
     /// Remove an authority from the wallet. Reallocs account smaller.
     RemoveAuthority {
-        precompile_ix_index: u8,
         remove_sig_scheme: u8,
         remove_pubkey: [u8; 33],
         new_threshold: u8, // 0 = keep current
@@ -247,14 +236,12 @@ pub enum MachineWalletInstruction<'a> {
 
     /// Change the threshold without adding/removing authorities.
     SetThreshold {
-        precompile_ix_index: u8,
         new_threshold: u8,
         max_slot: u64,
     },
 
     /// Wallet-owner path to close a revoked or expired session and reclaim rent.
     OwnerCloseSession {
-        precompile_ix_index: u8,
         max_slot: u64,
         session_authority: [u8; 32],
         destination: [u8; 32],
@@ -371,15 +358,13 @@ impl<'a> MachineWalletInstruction<'a> {
 
             // Execute
             1 => {
-                if rest.len() < 1 + 8 {
+                if rest.len() < 8 {
                     return Err(ProgramError::InvalidInstructionData);
                 }
-                let secp256r1_ix_index = rest[0];
-                let max_slot = u64::from_le_bytes(rest[1..9].try_into().unwrap());
-                let inner_instructions = parse_inner_instructions(&rest[9..])?;
+                let max_slot = u64::from_le_bytes(rest[0..8].try_into().unwrap());
+                let inner_instructions = parse_inner_instructions(&rest[8..])?;
 
                 Ok(Self::Execute {
-                    secp256r1_ix_index,
                     max_slot,
                     inner_instructions,
                 })
@@ -387,15 +372,13 @@ impl<'a> MachineWalletInstruction<'a> {
 
             // CloseWallet
             2 => {
-                if rest.len() != 1 + 8 + 32 {
+                if rest.len() != 8 + 32 {
                     return Err(ProgramError::InvalidInstructionData);
                 }
-                let secp256r1_ix_index = rest[0];
-                let max_slot = u64::from_le_bytes(rest[1..9].try_into().unwrap());
+                let max_slot = u64::from_le_bytes(rest[0..8].try_into().unwrap());
                 let mut destination = [0u8; 32];
-                destination.copy_from_slice(&rest[9..41]);
+                destination.copy_from_slice(&rest[8..40]);
                 Ok(Self::CloseWallet {
-                    secp256r1_ix_index,
                     max_slot,
                     destination,
                 })
@@ -403,34 +386,29 @@ impl<'a> MachineWalletInstruction<'a> {
 
             // AdvanceNonce
             3 => {
-                if rest.len() != 1 + 8 {
+                if rest.len() != 8 {
                     return Err(ProgramError::InvalidInstructionData);
                 }
-                let secp256r1_ix_index = rest[0];
-                let max_slot = u64::from_le_bytes(rest[1..9].try_into().unwrap());
-                Ok(Self::AdvanceNonce {
-                    secp256r1_ix_index,
-                    max_slot,
-                })
+                let max_slot = u64::from_le_bytes(rest[0..8].try_into().unwrap());
+                Ok(Self::AdvanceNonce { max_slot })
             }
 
             // CreateSession
             4 => {
-                // Minimum: secp256r1_ix_index(1) + max_slot(8) + session_authority(32)
-                //        + expiry_slot(8) + max_lamports_per_call(8)
-                //        + max_total_spent_lamports(8) + allowed_programs_count(1) = 66
-                const BASE_LEN: usize = 1 + 8 + 32 + 8 + 8 + 8 + 1;
+                // Minimum: max_slot(8) + session_authority(32) + expiry_slot(8)
+                //        + max_lamports_per_call(8) + max_total_spent_lamports(8)
+                //        + allowed_programs_count(1) = 65
+                const BASE_LEN: usize = 8 + 32 + 8 + 8 + 8 + 1;
                 if rest.len() < BASE_LEN {
                     return Err(ProgramError::InvalidInstructionData);
                 }
-                let secp256r1_ix_index = rest[0];
-                let max_slot = u64::from_le_bytes(rest[1..9].try_into().unwrap());
+                let max_slot = u64::from_le_bytes(rest[0..8].try_into().unwrap());
                 let mut session_authority = [0u8; 32];
-                session_authority.copy_from_slice(&rest[9..41]);
-                let expiry_slot = u64::from_le_bytes(rest[41..49].try_into().unwrap());
-                let max_lamports_per_call = u64::from_le_bytes(rest[49..57].try_into().unwrap());
-                let max_total_spent_lamports = u64::from_le_bytes(rest[57..65].try_into().unwrap());
-                let allowed_programs_count = rest[65];
+                session_authority.copy_from_slice(&rest[8..40]);
+                let expiry_slot = u64::from_le_bytes(rest[40..48].try_into().unwrap());
+                let max_lamports_per_call = u64::from_le_bytes(rest[48..56].try_into().unwrap());
+                let max_total_spent_lamports = u64::from_le_bytes(rest[56..64].try_into().unwrap());
+                let allowed_programs_count = rest[64];
 
                 // Reject zero (state deserialization also rejects it; keep both
                 // layers in sync so a malformed session cannot be created and
@@ -454,7 +432,6 @@ impl<'a> MachineWalletInstruction<'a> {
                 }
 
                 Ok(Self::CreateSession {
-                    secp256r1_ix_index,
                     max_slot,
                     session_authority,
                     expiry_slot,
@@ -473,16 +450,14 @@ impl<'a> MachineWalletInstruction<'a> {
 
             // RevokeSession
             6 => {
-                // Exact: secp256r1_ix_index(1) + max_slot(8) + session_authority(32) = 41
-                if rest.len() != 1 + 8 + 32 {
+                // Exact: max_slot(8) + session_authority(32) = 40
+                if rest.len() != 8 + 32 {
                     return Err(ProgramError::InvalidInstructionData);
                 }
-                let secp256r1_ix_index = rest[0];
-                let max_slot = u64::from_le_bytes(rest[1..9].try_into().unwrap());
+                let max_slot = u64::from_le_bytes(rest[0..8].try_into().unwrap());
                 let mut session_authority = [0u8; 32];
-                session_authority.copy_from_slice(&rest[9..41]);
+                session_authority.copy_from_slice(&rest[8..40]);
                 Ok(Self::RevokeSession {
-                    secp256r1_ix_index,
                     max_slot,
                     session_authority,
                 })
@@ -504,19 +479,17 @@ impl<'a> MachineWalletInstruction<'a> {
                 Ok(Self::CloseSession)
             }
 
-            // AddAuthority: disc(1) + precompile_ix_index(1) + new_sig_scheme(1) + new_pubkey(33) + new_threshold(1) + max_slot(8) = 44 bytes rest
+            // AddAuthority: disc(1) + new_sig_scheme(1) + new_pubkey(33) + new_threshold(1) + max_slot(8) = 43 bytes rest
             9 => {
-                if rest.len() != 1 + 1 + 33 + 1 + 8 {
+                if rest.len() != 1 + 33 + 1 + 8 {
                     return Err(ProgramError::InvalidInstructionData);
                 }
-                let precompile_ix_index = rest[0];
-                let new_sig_scheme = rest[1];
+                let new_sig_scheme = rest[0];
                 let mut new_pubkey = [0u8; 33];
-                new_pubkey.copy_from_slice(&rest[2..35]);
-                let new_threshold = rest[35];
-                let max_slot = u64::from_le_bytes(rest[36..44].try_into().unwrap());
+                new_pubkey.copy_from_slice(&rest[1..34]);
+                let new_threshold = rest[34];
+                let max_slot = u64::from_le_bytes(rest[35..43].try_into().unwrap());
                 Ok(Self::AddAuthority {
-                    precompile_ix_index,
                     new_sig_scheme,
                     new_pubkey,
                     new_threshold,
@@ -526,17 +499,15 @@ impl<'a> MachineWalletInstruction<'a> {
 
             // RemoveAuthority: same layout as AddAuthority
             10 => {
-                if rest.len() != 1 + 1 + 33 + 1 + 8 {
+                if rest.len() != 1 + 33 + 1 + 8 {
                     return Err(ProgramError::InvalidInstructionData);
                 }
-                let precompile_ix_index = rest[0];
-                let remove_sig_scheme = rest[1];
+                let remove_sig_scheme = rest[0];
                 let mut remove_pubkey = [0u8; 33];
-                remove_pubkey.copy_from_slice(&rest[2..35]);
-                let new_threshold = rest[35];
-                let max_slot = u64::from_le_bytes(rest[36..44].try_into().unwrap());
+                remove_pubkey.copy_from_slice(&rest[1..34]);
+                let new_threshold = rest[34];
+                let max_slot = u64::from_le_bytes(rest[35..43].try_into().unwrap());
                 Ok(Self::RemoveAuthority {
-                    precompile_ix_index,
                     remove_sig_scheme,
                     remove_pubkey,
                     new_threshold,
@@ -544,34 +515,30 @@ impl<'a> MachineWalletInstruction<'a> {
                 })
             }
 
-            // SetThreshold: disc(1) + precompile_ix_index(1) + new_threshold(1) + max_slot(8) = 10 bytes rest
+            // SetThreshold: disc(1) + new_threshold(1) + max_slot(8) = 9 bytes rest
             11 => {
-                if rest.len() != 1 + 1 + 8 {
+                if rest.len() != 1 + 8 {
                     return Err(ProgramError::InvalidInstructionData);
                 }
-                let precompile_ix_index = rest[0];
-                let new_threshold = rest[1];
-                let max_slot = u64::from_le_bytes(rest[2..10].try_into().unwrap());
+                let new_threshold = rest[0];
+                let max_slot = u64::from_le_bytes(rest[1..9].try_into().unwrap());
                 Ok(Self::SetThreshold {
-                    precompile_ix_index,
                     new_threshold,
                     max_slot,
                 })
             }
 
-            // OwnerCloseSession: disc(1) + precompile_ix_index(1) + max_slot(8) + session_authority(32) + destination(32) = 73 bytes rest
+            // OwnerCloseSession: disc(1) + max_slot(8) + session_authority(32) + destination(32) = 72 bytes rest
             12 => {
-                if rest.len() != 1 + 8 + 32 + 32 {
+                if rest.len() != 8 + 32 + 32 {
                     return Err(ProgramError::InvalidInstructionData);
                 }
-                let precompile_ix_index = rest[0];
-                let max_slot = u64::from_le_bytes(rest[1..9].try_into().unwrap());
+                let max_slot = u64::from_le_bytes(rest[0..8].try_into().unwrap());
                 let mut session_authority = [0u8; 32];
-                session_authority.copy_from_slice(&rest[9..41]);
+                session_authority.copy_from_slice(&rest[8..40]);
                 let mut destination = [0u8; 32];
-                destination.copy_from_slice(&rest[41..73]);
+                destination.copy_from_slice(&rest[40..72]);
                 Ok(Self::OwnerCloseSession {
-                    precompile_ix_index,
                     max_slot,
                     session_authority,
                     destination,
@@ -631,7 +598,6 @@ mod tests {
     #[test]
     fn test_parse_execute_with_one_inner() {
         let mut data = vec![1u8]; // discriminator
-        data.push(3); // secp256r1_ix_index
         data.extend_from_slice(&999u64.to_le_bytes()); // max_slot
 
         // inner_instruction_count = 1
@@ -655,11 +621,9 @@ mod tests {
         let ix = MachineWalletInstruction::unpack(&data).unwrap();
         match ix {
             MachineWalletInstruction::Execute {
-                secp256r1_ix_index,
                 max_slot,
                 inner_instructions,
             } => {
-                assert_eq!(secp256r1_ix_index, 3);
                 assert_eq!(max_slot, 999);
                 assert_eq!(inner_instructions.len(), 1);
                 assert_eq!(inner_instructions[0].program_id, program_id);
@@ -678,18 +642,15 @@ mod tests {
     #[test]
     fn test_parse_execute_empty() {
         let mut data = vec![1u8]; // discriminator
-        data.push(0); // secp256r1_ix_index
         data.extend_from_slice(&500u64.to_le_bytes()); // max_slot
         data.extend_from_slice(&0u32.to_le_bytes()); // 0 inner instructions
 
         let ix = MachineWalletInstruction::unpack(&data).unwrap();
         match ix {
             MachineWalletInstruction::Execute {
-                secp256r1_ix_index,
                 max_slot,
                 inner_instructions,
             } => {
-                assert_eq!(secp256r1_ix_index, 0);
                 assert_eq!(max_slot, 500);
                 assert!(inner_instructions.is_empty());
             }
@@ -700,7 +661,6 @@ mod tests {
     #[test]
     fn test_parse_execute_multiple_inner() {
         let mut data = vec![1u8]; // discriminator
-        data.push(5); // secp256r1_ix_index
         data.extend_from_slice(&1000u64.to_le_bytes()); // max_slot
 
         // 2 inner instructions
@@ -740,7 +700,7 @@ mod tests {
 
     #[test]
     fn test_parse_close_wallet() {
-        let mut data = vec![2u8, 7]; // discriminator + secp256r1_ix_index
+        let mut data = vec![2u8]; // discriminator
         data.extend_from_slice(&42u64.to_le_bytes()); // max_slot
         let dest = [0xCCu8; 32];
         data.extend_from_slice(&dest); // destination
@@ -748,11 +708,9 @@ mod tests {
         let ix = MachineWalletInstruction::unpack(&data).unwrap();
         match ix {
             MachineWalletInstruction::CloseWallet {
-                secp256r1_ix_index,
                 max_slot,
                 destination,
             } => {
-                assert_eq!(secp256r1_ix_index, 7);
                 assert_eq!(max_slot, 42);
                 assert_eq!(destination, dest);
             }
@@ -762,16 +720,12 @@ mod tests {
 
     #[test]
     fn test_parse_advance_nonce() {
-        let mut data = vec![3u8, 2]; // discriminator + secp256r1_ix_index
+        let mut data = vec![3u8]; // discriminator
         data.extend_from_slice(&100u64.to_le_bytes()); // max_slot
 
         let ix = MachineWalletInstruction::unpack(&data).unwrap();
         match ix {
-            MachineWalletInstruction::AdvanceNonce {
-                secp256r1_ix_index,
-                max_slot,
-            } => {
-                assert_eq!(secp256r1_ix_index, 2);
+            MachineWalletInstruction::AdvanceNonce { max_slot } => {
                 assert_eq!(max_slot, 100);
             }
             _ => panic!("Expected AdvanceNonce"),
@@ -815,16 +769,16 @@ mod tests {
 
     #[test]
     fn test_truncated_execute_no_max_slot() {
-        // Discriminator + ix_index, but no max_slot
-        let data = vec![1u8, 0];
+        // Discriminator only, no max_slot.
+        let data = vec![1u8];
         let result = MachineWalletInstruction::unpack(&data);
         assert_eq!(result.unwrap_err(), ProgramError::InvalidInstructionData);
     }
 
     #[test]
     fn test_truncated_execute_no_count() {
-        // Discriminator + ix_index + max_slot, but no count
-        let mut data = vec![1u8, 0];
+        // Discriminator + max_slot, but no inner-instruction count.
+        let mut data = vec![1u8];
         data.extend_from_slice(&100u64.to_le_bytes());
         let result = MachineWalletInstruction::unpack(&data);
         assert_eq!(result.unwrap_err(), ProgramError::InvalidInstructionData);
@@ -832,7 +786,7 @@ mod tests {
 
     #[test]
     fn test_truncated_execute_inner_missing_program_id() {
-        let mut data = vec![1u8, 0]; // discriminator + ix_index
+        let mut data = vec![1u8];
         data.extend_from_slice(&100u64.to_le_bytes()); // max_slot
         data.extend_from_slice(&1u32.to_le_bytes()); // count = 1
         data.extend_from_slice(&[0xBBu8; 16]); // only 16 bytes of program_id
@@ -842,7 +796,7 @@ mod tests {
 
     #[test]
     fn test_truncated_execute_inner_missing_data() {
-        let mut data = vec![1u8, 0];
+        let mut data = vec![1u8];
         data.extend_from_slice(&100u64.to_le_bytes()); // max_slot
         data.extend_from_slice(&1u32.to_le_bytes());
         data.extend_from_slice(&[0xBBu8; 32]); // program_id
@@ -855,7 +809,7 @@ mod tests {
 
     #[test]
     fn test_execute_rejects_trailing_bytes() {
-        let mut data = vec![1u8, 0];
+        let mut data = vec![1u8];
         data.extend_from_slice(&100u64.to_le_bytes());
         data.extend_from_slice(&0u32.to_le_bytes());
         data.push(0xFF);
@@ -872,7 +826,7 @@ mod tests {
 
     #[test]
     fn test_truncated_close_wallet_no_destination() {
-        let mut data = vec![2u8, 0]; // discriminator + ix_index
+        let mut data = vec![2u8];
         data.extend_from_slice(&42u64.to_le_bytes()); // max_slot but no destination
         let result = MachineWalletInstruction::unpack(&data);
         assert_eq!(result.unwrap_err(), ProgramError::InvalidInstructionData);
@@ -880,7 +834,7 @@ mod tests {
 
     #[test]
     fn test_close_wallet_rejects_trailing_bytes() {
-        let mut data = vec![2u8, 0];
+        let mut data = vec![2u8];
         data.extend_from_slice(&42u64.to_le_bytes());
         data.extend_from_slice(&[0xCCu8; 32]);
         data.push(0xFF);
@@ -890,7 +844,7 @@ mod tests {
 
     #[test]
     fn test_advance_nonce_rejects_trailing_bytes() {
-        let mut data = vec![3u8, 0];
+        let mut data = vec![3u8];
         data.extend_from_slice(&42u64.to_le_bytes());
         data.push(0xFF);
         let result = MachineWalletInstruction::unpack(&data);
@@ -899,7 +853,7 @@ mod tests {
 
     #[test]
     fn test_invalid_account_flags_rejected() {
-        let mut data = vec![1u8, 0]; // Execute discriminator
+        let mut data = vec![1u8]; // Execute discriminator
         data.extend_from_slice(&100u64.to_le_bytes()); // max_slot
         data.extend_from_slice(&1u32.to_le_bytes()); // count = 1
         data.extend_from_slice(&[0xAAu8; 32]); // program_id
@@ -912,7 +866,7 @@ mod tests {
 
     #[test]
     fn test_valid_account_flags_accepted() {
-        let mut data = vec![1u8, 0];
+        let mut data = vec![1u8];
         data.extend_from_slice(&100u64.to_le_bytes());
         data.extend_from_slice(&1u32.to_le_bytes());
         data.extend_from_slice(&[0xAAu8; 32]);
@@ -926,7 +880,7 @@ mod tests {
 
     #[test]
     fn test_too_many_inner_instructions() {
-        let mut data = vec![1u8, 0];
+        let mut data = vec![1u8];
         data.extend_from_slice(&100u64.to_le_bytes());
         data.extend_from_slice(&(MAX_INNER_INSTRUCTIONS as u32 + 1).to_le_bytes());
         let result = MachineWalletInstruction::unpack(&data);
@@ -939,7 +893,7 @@ mod tests {
     #[test]
     fn test_max_inner_instructions_accepted() {
         // count = MAX but no actual data — will fail on parsing first inner ix, not on limit
-        let mut data = vec![1u8, 0];
+        let mut data = vec![1u8];
         data.extend_from_slice(&100u64.to_le_bytes());
         data.extend_from_slice(&(MAX_INNER_INSTRUCTIONS as u32).to_le_bytes());
         let result = MachineWalletInstruction::unpack(&data);
@@ -950,7 +904,6 @@ mod tests {
     #[test]
     fn test_parse_create_session() {
         let mut data = vec![4u8]; // discriminator
-        data.push(2); // secp256r1_ix_index
         data.extend_from_slice(&12345u64.to_le_bytes()); // max_slot
         let session_authority = [0xAAu8; 32];
         data.extend_from_slice(&session_authority); // session_authority
@@ -966,7 +919,6 @@ mod tests {
         let ix = MachineWalletInstruction::unpack(&data).unwrap();
         match ix {
             MachineWalletInstruction::CreateSession {
-                secp256r1_ix_index,
                 max_slot,
                 session_authority: sa,
                 expiry_slot,
@@ -975,7 +927,6 @@ mod tests {
                 allowed_programs_count,
                 allowed_programs,
             } => {
-                assert_eq!(secp256r1_ix_index, 2);
                 assert_eq!(max_slot, 12345);
                 assert_eq!(sa, session_authority);
                 assert_eq!(expiry_slot, 99999);
@@ -993,7 +944,6 @@ mod tests {
     #[test]
     fn test_parse_create_session_zero_programs_rejected() {
         let mut data = vec![4u8]; // discriminator
-        data.push(0); // secp256r1_ix_index
         data.extend_from_slice(&0u64.to_le_bytes()); // max_slot
         data.extend_from_slice(&[0u8; 32]); // session_authority
         data.extend_from_slice(&0u64.to_le_bytes()); // expiry_slot
@@ -1011,7 +961,6 @@ mod tests {
     #[test]
     fn test_parse_create_session_too_many_programs() {
         let mut data = vec![4u8]; // discriminator
-        data.push(0); // secp256r1_ix_index
         data.extend_from_slice(&0u64.to_le_bytes()); // max_slot
         data.extend_from_slice(&[0u8; 32]); // session_authority
         data.extend_from_slice(&0u64.to_le_bytes()); // expiry_slot
@@ -1066,7 +1015,6 @@ mod tests {
     #[test]
     fn test_parse_revoke_session() {
         let mut data = vec![6u8]; // discriminator
-        data.push(1); // secp256r1_ix_index
         data.extend_from_slice(&777u64.to_le_bytes()); // max_slot
         let session_authority = [0xBBu8; 32];
         data.extend_from_slice(&session_authority);
@@ -1074,11 +1022,9 @@ mod tests {
         let ix = MachineWalletInstruction::unpack(&data).unwrap();
         match ix {
             MachineWalletInstruction::RevokeSession {
-                secp256r1_ix_index,
                 max_slot,
                 session_authority: sa,
             } => {
-                assert_eq!(secp256r1_ix_index, 1);
                 assert_eq!(max_slot, 777);
                 assert_eq!(sa, session_authority);
             }
@@ -1126,7 +1072,6 @@ mod tests {
     #[test]
     fn test_parse_add_authority() {
         let mut data = vec![9u8]; // discriminator
-        data.push(0x03); // precompile_ix_index = 3
         data.push(0x01); // new_sig_scheme = 1
         let pubkey = [0xABu8; 33];
         data.extend_from_slice(&pubkey); // new_pubkey
@@ -1136,13 +1081,11 @@ mod tests {
         let ix = MachineWalletInstruction::unpack(&data).unwrap();
         match ix {
             MachineWalletInstruction::AddAuthority {
-                precompile_ix_index,
                 new_sig_scheme,
                 new_pubkey,
                 new_threshold,
                 max_slot,
             } => {
-                assert_eq!(precompile_ix_index, 3);
                 assert_eq!(new_sig_scheme, 1);
                 assert_eq!(new_pubkey, pubkey);
                 assert_eq!(new_threshold, 2);
@@ -1155,7 +1098,6 @@ mod tests {
     #[test]
     fn test_parse_add_authority_truncated() {
         let mut data = vec![9u8];
-        data.push(0); // precompile_ix_index
         data.push(0); // new_sig_scheme
         data.extend_from_slice(&[0u8; 20]); // incomplete (need 33 + 1 + 8 more)
         let result = MachineWalletInstruction::unpack(&data);
@@ -1165,7 +1107,6 @@ mod tests {
     #[test]
     fn test_parse_add_authority_trailing() {
         let mut data = vec![9u8];
-        data.push(0); // precompile_ix_index
         data.push(0); // new_sig_scheme
         data.extend_from_slice(&[0u8; 33]); // new_pubkey
         data.push(1); // new_threshold
@@ -1180,7 +1121,6 @@ mod tests {
     #[test]
     fn test_parse_remove_authority() {
         let mut data = vec![10u8]; // discriminator
-        data.push(0x02); // precompile_ix_index = 2
         data.push(0x00); // remove_sig_scheme = 0
         let pubkey = [0xCDu8; 33];
         data.extend_from_slice(&pubkey); // remove_pubkey
@@ -1190,13 +1130,11 @@ mod tests {
         let ix = MachineWalletInstruction::unpack(&data).unwrap();
         match ix {
             MachineWalletInstruction::RemoveAuthority {
-                precompile_ix_index,
                 remove_sig_scheme,
                 remove_pubkey,
                 new_threshold,
                 max_slot,
             } => {
-                assert_eq!(precompile_ix_index, 2);
                 assert_eq!(remove_sig_scheme, 0);
                 assert_eq!(remove_pubkey, pubkey);
                 assert_eq!(new_threshold, 0);
@@ -1209,7 +1147,6 @@ mod tests {
     #[test]
     fn test_parse_remove_authority_truncated() {
         let mut data = vec![10u8];
-        data.push(0); // precompile_ix_index
         data.push(0); // remove_sig_scheme
         data.extend_from_slice(&[0u8; 10]); // incomplete
         let result = MachineWalletInstruction::unpack(&data);
@@ -1221,18 +1158,15 @@ mod tests {
     #[test]
     fn test_parse_set_threshold() {
         let mut data = vec![11u8]; // discriminator
-        data.push(0x01); // precompile_ix_index = 1
         data.push(3); // new_threshold
         data.extend_from_slice(&777u64.to_le_bytes()); // max_slot
 
         let ix = MachineWalletInstruction::unpack(&data).unwrap();
         match ix {
             MachineWalletInstruction::SetThreshold {
-                precompile_ix_index,
                 new_threshold,
                 max_slot,
             } => {
-                assert_eq!(precompile_ix_index, 1);
                 assert_eq!(new_threshold, 3);
                 assert_eq!(max_slot, 777);
             }
@@ -1243,7 +1177,6 @@ mod tests {
     #[test]
     fn test_parse_set_threshold_truncated() {
         let mut data = vec![11u8];
-        data.push(0); // precompile_ix_index
         data.push(1); // new_threshold only — missing max_slot
         let result = MachineWalletInstruction::unpack(&data);
         assert_eq!(result.unwrap_err(), ProgramError::InvalidInstructionData);
@@ -1252,7 +1185,6 @@ mod tests {
     #[test]
     fn test_parse_set_threshold_trailing() {
         let mut data = vec![11u8];
-        data.push(0); // precompile_ix_index
         data.push(2); // new_threshold
         data.extend_from_slice(&100u64.to_le_bytes()); // max_slot
         data.push(0xFF); // trailing byte — should be rejected
@@ -1263,7 +1195,6 @@ mod tests {
     #[test]
     fn test_parse_owner_close_session() {
         let mut data = vec![12u8];
-        data.push(4);
         data.extend_from_slice(&777u64.to_le_bytes());
         let session_authority = [0xABu8; 32];
         let destination = [0xCDu8; 32];
@@ -1273,12 +1204,10 @@ mod tests {
         let ix = MachineWalletInstruction::unpack(&data).unwrap();
         match ix {
             MachineWalletInstruction::OwnerCloseSession {
-                precompile_ix_index,
                 max_slot,
                 session_authority: sa,
                 destination: dest,
             } => {
-                assert_eq!(precompile_ix_index, 4);
                 assert_eq!(max_slot, 777);
                 assert_eq!(sa, session_authority);
                 assert_eq!(dest, destination);
@@ -1290,7 +1219,6 @@ mod tests {
     #[test]
     fn test_parse_owner_close_session_truncated() {
         let mut data = vec![12u8];
-        data.push(1);
         data.extend_from_slice(&999u64.to_le_bytes());
         data.extend_from_slice(&[0xAAu8; 31]);
         let result = MachineWalletInstruction::unpack(&data);
@@ -1300,7 +1228,6 @@ mod tests {
     #[test]
     fn test_parse_owner_close_session_trailing() {
         let mut data = vec![12u8];
-        data.push(1);
         data.extend_from_slice(&999u64.to_le_bytes());
         data.extend_from_slice(&[0xAAu8; 32]);
         data.extend_from_slice(&[0xBBu8; 32]);
@@ -1458,17 +1385,15 @@ mod tests {
         matches!(ix, MachineWalletInstruction::ProvideWebAuthnEvidence { .. });
     }
 
-    /// The previously exposed `PROVIDE_WEBAUTHN_EVIDENCE_DISCRIMINATOR` must
-    /// match the wire discriminator we accept.
+    /// `PROVIDE_WEBAUTHN_EVIDENCE_DISCRIMINATOR` must match the wire discriminator we accept.
     #[test]
     fn test_sidecar_discriminator_constant() {
         assert_eq!(PROVIDE_WEBAUTHN_EVIDENCE_DISCRIMINATOR, 14);
     }
 
-    /// Discriminator 13 (previously `ExecuteWebAuthn`) must now be rejected —
-    /// clients relying on it must migrate to `Execute` + sidecar.
+    /// Discriminator 13 is unknown and must be rejected.
     #[test]
-    fn test_disc_13_is_reserved_and_rejected() {
+    fn test_disc_13_rejected() {
         let data = vec![13u8];
         let err = MachineWalletInstruction::unpack(&data).unwrap_err();
         assert_eq!(err, ProgramError::InvalidInstructionData);

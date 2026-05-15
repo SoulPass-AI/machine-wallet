@@ -60,7 +60,6 @@ pub fn compute_owner_close_session_message(
 pub fn process(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
-    precompile_ix_index: u8,
     max_slot: u64,
     session_authority: [u8; 32],
     destination_pubkey: [u8; 32],
@@ -98,15 +97,7 @@ pub fn process(
     let wallet = MachineWallet::deserialize_runtime(&wallet_data)?;
     drop(wallet_data);
 
-    let id = wallet.id();
-    let expected_wallet_pda = Pubkey::create_program_address(
-        &[MachineWallet::SEED_PREFIX, &id, &[wallet.bump]],
-        program_id,
-    )
-    .map_err(|_| MachineWalletError::InvalidWalletPDA)?;
-    if *wallet_account.key != expected_wallet_pda {
-        return Err(MachineWalletError::InvalidWalletPDA.into());
-    }
+    super::verify_wallet_pda(wallet_account, &wallet, program_id)?;
 
     let session_data = session_account.try_borrow_data()?;
     let session = SessionState::deserialize_runtime(&session_data)?;
@@ -159,7 +150,6 @@ pub fn process(
         instructions_sysvar,
         program_id,
         &wallet,
-        precompile_ix_index,
         &expected_message,
     )?;
 

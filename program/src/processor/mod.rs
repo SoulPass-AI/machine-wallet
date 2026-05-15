@@ -19,7 +19,9 @@ use solana_program::{
     pubkey::Pubkey,
 };
 
+use crate::error::MachineWalletError;
 use crate::instruction::MachineWalletInstruction;
+use crate::state::MachineWallet;
 
 /// Reject any account that isn't the instructions sysvar.
 ///
@@ -30,6 +32,27 @@ use crate::instruction::MachineWalletInstruction;
 pub(crate) fn require_instructions_sysvar(account: &AccountInfo) -> ProgramResult {
     if *account.key != solana_program::sysvar::instructions::ID {
         return Err(ProgramError::InvalidAccountData);
+    }
+    Ok(())
+}
+
+/// Re-derive the wallet PDA from the cached `(id, bump)` and verify it
+/// matches `wallet_account.key`. Centralizes the check so every signed
+/// operation refuses to trust a forged wallet account.
+#[inline(always)]
+pub(crate) fn verify_wallet_pda(
+    wallet_account: &AccountInfo,
+    wallet: &MachineWallet,
+    program_id: &Pubkey,
+) -> ProgramResult {
+    let id = wallet.id();
+    let expected = Pubkey::create_program_address(
+        &[MachineWallet::SEED_PREFIX, &id, &[wallet.bump]],
+        program_id,
+    )
+    .map_err(|_| MachineWalletError::InvalidWalletPDA)?;
+    if *wallet_account.key != expected {
+        return Err(MachineWalletError::InvalidWalletPDA.into());
     }
     Ok(())
 }
@@ -48,33 +71,17 @@ pub fn process_instruction(
             authority,
         } => create_wallet::process(program_id, accounts, max_slot, sig_scheme, authority),
         MachineWalletInstruction::Execute {
-            secp256r1_ix_index,
             max_slot,
             inner_instructions,
-        } => execute::process(
-            program_id,
-            accounts,
-            secp256r1_ix_index,
-            max_slot,
-            inner_instructions,
-        ),
+        } => execute::process(program_id, accounts, max_slot, inner_instructions),
         MachineWalletInstruction::CloseWallet {
-            secp256r1_ix_index,
             max_slot,
             destination,
-        } => close_wallet::process(
-            program_id,
-            accounts,
-            secp256r1_ix_index,
-            max_slot,
-            destination,
-        ),
-        MachineWalletInstruction::AdvanceNonce {
-            secp256r1_ix_index,
-            max_slot,
-        } => advance_nonce::process(program_id, accounts, secp256r1_ix_index, max_slot),
+        } => close_wallet::process(program_id, accounts, max_slot, destination),
+        MachineWalletInstruction::AdvanceNonce { max_slot } => {
+            advance_nonce::process(program_id, accounts, max_slot)
+        }
         MachineWalletInstruction::CreateSession {
-            secp256r1_ix_index,
             max_slot,
             session_authority,
             expiry_slot,
@@ -85,7 +92,6 @@ pub fn process_instruction(
         } => create_session::process(
             program_id,
             accounts,
-            secp256r1_ix_index,
             max_slot,
             session_authority,
             expiry_slot,
@@ -98,22 +104,14 @@ pub fn process_instruction(
             session_execute::process(program_id, accounts, inner_instructions)
         }
         MachineWalletInstruction::RevokeSession {
-            secp256r1_ix_index,
             max_slot,
             session_authority,
-        } => revoke_session::process(
-            program_id,
-            accounts,
-            secp256r1_ix_index,
-            max_slot,
-            session_authority,
-        ),
+        } => revoke_session::process(program_id, accounts, max_slot, session_authority),
         MachineWalletInstruction::SelfRevokeSession => {
             self_revoke_session::process(program_id, accounts)
         }
         MachineWalletInstruction::CloseSession => close_session::process(program_id, accounts),
         MachineWalletInstruction::AddAuthority {
-            precompile_ix_index,
             new_sig_scheme,
             new_pubkey,
             new_threshold,
@@ -121,14 +119,12 @@ pub fn process_instruction(
         } => add_authority::process(
             program_id,
             accounts,
-            precompile_ix_index,
             new_sig_scheme,
             new_pubkey,
             new_threshold,
             max_slot,
         ),
         MachineWalletInstruction::RemoveAuthority {
-            precompile_ix_index,
             remove_sig_scheme,
             remove_pubkey,
             new_threshold,
@@ -136,32 +132,22 @@ pub fn process_instruction(
         } => remove_authority::process(
             program_id,
             accounts,
-            precompile_ix_index,
             remove_sig_scheme,
             remove_pubkey,
             new_threshold,
             max_slot,
         ),
         MachineWalletInstruction::SetThreshold {
-            precompile_ix_index,
             new_threshold,
             max_slot,
-        } => set_threshold::process(
-            program_id,
-            accounts,
-            precompile_ix_index,
-            new_threshold,
-            max_slot,
-        ),
+        } => set_threshold::process(program_id, accounts, new_threshold, max_slot),
         MachineWalletInstruction::OwnerCloseSession {
-            precompile_ix_index,
             max_slot,
             session_authority,
             destination,
         } => owner_close_session::process(
             program_id,
             accounts,
-            precompile_ix_index,
             max_slot,
             session_authority,
             destination,

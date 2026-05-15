@@ -1,7 +1,4 @@
-use solana_program::{
-    account_info::AccountInfo, program_error::ProgramError, pubkey::Pubkey,
-    sysvar::instructions::load_instruction_at_checked,
-};
+use solana_program::{program_error::ProgramError, pubkey::Pubkey};
 
 use crate::error::MachineWalletError;
 use crate::secp256r1::{SignatureOffsets, HEADER_SIZE, SIGNATURE_OFFSETS_SIZE};
@@ -30,8 +27,7 @@ pub struct Ed25519VerifyResult {
 ///
 /// This function operates on raw instruction data bytes and does **not** check the
 /// program ID. It is intended for use by `threshold.rs` when scanning multiple
-/// instructions in the transaction, as well as internally by
-/// `verify_precompile_instruction`.
+/// instructions in the transaction.
 ///
 /// Validates:
 /// 1. Exactly 1 signature (Phase 0)
@@ -90,35 +86,6 @@ pub fn parse_precompile_data(data: &[u8]) -> Result<Ed25519VerifyResult, Program
     message.copy_from_slice(&data[msg_start..msg_end]);
 
     Ok(Ed25519VerifyResult { pubkey, message })
-}
-
-/// Verify the Ed25519 precompile instruction at the given index.
-///
-/// The precompile cannot be called via CPI — it must be a separate instruction in the
-/// transaction. If our program is executing, the precompile instruction already succeeded
-/// (Solana runtime verifies all precompile instructions before executing any program).
-///
-/// We load the instruction via sysvar introspection and verify:
-/// 1. Correct program ID (Ed25519 precompile)
-/// 2. Exactly 1 signature (Phase 0)
-/// 3. All data references point to the same instruction (instruction_index = 0xFFFF)
-/// 4. `message_data_size == 32`
-///
-/// Returns the extracted pubkey and signed message.
-pub fn verify_precompile_instruction(
-    instructions_sysvar: &AccountInfo,
-    precompile_ix_index: u8,
-) -> Result<Ed25519VerifyResult, ProgramError> {
-    // Load the instruction at the specified index from the sysvar
-    let ix = load_instruction_at_checked(precompile_ix_index as usize, instructions_sysvar)
-        .map_err(|_| MachineWalletError::InstructionMissing)?;
-
-    // Verify it's the Ed25519 precompile
-    if ix.program_id != ED25519_PROGRAM_ID {
-        return Err(MachineWalletError::InvalidPrecompileInstruction.into());
-    }
-
-    parse_precompile_data(&ix.data)
 }
 
 #[cfg(test)]

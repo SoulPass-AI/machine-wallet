@@ -273,16 +273,8 @@ fn prepare_execute_context(
     let wallet = MachineWallet::deserialize_runtime(&data)?;
     drop(data);
 
-    // 8. Verify wallet PDA using cached bump (id computed from authority, ~100 CU syscall)
-    let id = wallet.id();
-    let expected_wallet_pda = Pubkey::create_program_address(
-        &[MachineWallet::SEED_PREFIX, &id, &[wallet.bump]],
-        program_id,
-    )
-    .map_err(|_| MachineWalletError::InvalidWalletPDA)?;
-    if *wallet_account.key != expected_wallet_pda {
-        return Err(MachineWalletError::InvalidWalletPDA.into());
-    }
+    // 8. Verify wallet PDA using cached bump.
+    super::verify_wallet_pda(wallet_account, &wallet, program_id)?;
 
     // 9. Verify vault PDA using cached vault_bump (saves compute vs find_program_address)
     let expected_vault_pda = Pubkey::create_program_address(
@@ -310,7 +302,6 @@ fn prepare_execute_context(
 pub fn process(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
-    secp256r1_ix_index: u8,
     max_slot: u64,
     inner_instructions: Vec<InnerInstructionRef<'_>>,
 ) -> ProgramResult {
@@ -346,7 +337,6 @@ pub fn process(
         instructions_sysvar,
         program_id,
         &wallet,
-        secp256r1_ix_index,
         &expected_message,
     )?;
 
@@ -366,7 +356,8 @@ pub fn process(
 
     // Execute CPI for each inner instruction.
     // SECURITY: inner_hash is computed over the resolved Pubkeys, not raw indices.
-    // Reordering or substituting `remaining_accounts` now changes the signed message.
+    // Reordering or substituting `remaining_accounts` changes the signed message,
+    // so a relay cannot rewrite them.
     let vault_signer_seeds: &[&[u8]] = &[
         MachineWallet::VAULT_SEED_PREFIX,
         wallet_account.key.as_ref(),

@@ -154,13 +154,12 @@ fn build_ed25519_precompile_ix(authority: &Keypair, message: &[u8; 32]) -> Instr
 fn build_add_authority_ix(
     fee_payer: &Pubkey,
     wallet_pda: &Pubkey,
-    precompile_ix_index: u8,
     new_sig_scheme: u8,
     new_pubkey: &[u8; 33],
     new_threshold: u8,
     max_slot: u64,
 ) -> Instruction {
-    let mut data = vec![9u8, precompile_ix_index, new_sig_scheme];
+    let mut data = vec![9u8, new_sig_scheme];
     data.extend_from_slice(new_pubkey);
     data.push(new_threshold);
     data.extend_from_slice(&max_slot.to_le_bytes());
@@ -180,13 +179,12 @@ fn build_add_authority_ix(
 fn build_remove_authority_ix(
     fee_payer: &Pubkey,
     wallet_pda: &Pubkey,
-    precompile_ix_index: u8,
     remove_sig_scheme: u8,
     remove_pubkey: &[u8; 33],
     new_threshold: u8,
     max_slot: u64,
 ) -> Instruction {
-    let mut data = vec![10u8, precompile_ix_index, remove_sig_scheme];
+    let mut data = vec![10u8, remove_sig_scheme];
     data.extend_from_slice(remove_pubkey);
     data.push(new_threshold);
     data.extend_from_slice(&max_slot.to_le_bytes());
@@ -214,7 +212,6 @@ fn build_create_session_ix(
     fee_payer: &Pubkey,
     wallet_pda: &Pubkey,
     session_pda: &Pubkey,
-    precompile_ix_index: u8,
     max_slot: u64,
     session_authority: &Pubkey,
     expiry_slot: u64,
@@ -222,7 +219,7 @@ fn build_create_session_ix(
     max_total_spent_lamports: u64,
     allowed_programs: &[Pubkey],
 ) -> Instruction {
-    let mut data = vec![4u8, precompile_ix_index];
+    let mut data = vec![4u8];
     data.extend_from_slice(&max_slot.to_le_bytes());
     data.extend_from_slice(session_authority.as_ref());
     data.extend_from_slice(&expiry_slot.to_le_bytes());
@@ -250,11 +247,10 @@ fn build_revoke_session_ix(
     fee_payer: &Pubkey,
     wallet_pda: &Pubkey,
     session_pda: &Pubkey,
-    precompile_ix_index: u8,
     max_slot: u64,
     session_authority: &Pubkey,
 ) -> Instruction {
-    let mut data = vec![6u8, precompile_ix_index];
+    let mut data = vec![6u8];
     data.extend_from_slice(&max_slot.to_le_bytes());
     data.extend_from_slice(session_authority.as_ref());
 
@@ -310,12 +306,11 @@ fn build_owner_close_session_ix(
     fee_payer: &Pubkey,
     wallet_pda: &Pubkey,
     session_pda: &Pubkey,
-    precompile_ix_index: u8,
     max_slot: u64,
     session_authority: &Pubkey,
     destination: &Pubkey,
 ) -> Instruction {
-    let mut data = vec![12u8, precompile_ix_index];
+    let mut data = vec![12u8];
     data.extend_from_slice(&max_slot.to_le_bytes());
     data.extend_from_slice(session_authority.as_ref());
     data.extend_from_slice(destination.as_ref());
@@ -387,13 +382,11 @@ fn build_execute_ix(
     fee_payer: &Pubkey,
     wallet_pda: &Pubkey,
     vault_pda: &Pubkey,
-    secp256r1_ix_index: u8,
     max_slot: u64,
     inner_instructions: &[InnerInstruction],
     remaining_account_metas: &[AccountMeta],
 ) -> Instruction {
     let mut data = vec![1u8]; // discriminator = Execute
-    data.push(secp256r1_ix_index);
     data.extend_from_slice(&max_slot.to_le_bytes());
     data.extend_from_slice(&(inner_instructions.len() as u32).to_le_bytes());
     for inner in inner_instructions {
@@ -423,16 +416,16 @@ fn build_execute_ix(
     }
 }
 
-/// Build a CloseWallet instruction (now includes destination in data).
+/// Build a CloseWallet instruction. `destination` is part of the signed data
+/// so a relay cannot redirect the rent claim.
 fn build_close_wallet_ix(
     fee_payer: &Pubkey,
     wallet_pda: &Pubkey,
     vault_pda: &Pubkey,
     destination: &Pubkey,
-    secp256r1_ix_index: u8,
     max_slot: u64,
 ) -> Instruction {
-    let mut data = vec![2u8, secp256r1_ix_index]; // discriminator = CloseWallet
+    let mut data = vec![2u8]; // discriminator = CloseWallet
     data.extend_from_slice(&max_slot.to_le_bytes());
     data.extend_from_slice(&destination.to_bytes()); // destination pubkey in signed data
 
@@ -568,7 +561,7 @@ async fn create_session_helper(
         session_authority,
         expiry_slot,
         max_lamports_per_call,
-        0, // max_total_spent_lamports = 0 → lifetime cap disabled (legacy behavior)
+        0, // max_total_spent_lamports = 0 → lifetime cap disabled
         allowed_programs,
     )
     .await
@@ -614,7 +607,6 @@ async fn create_session_helper_full(
                 &payer.pubkey(),
                 wallet_pda,
                 &session_pda,
-                0,
                 u64::MAX,
                 &session_authority.pubkey(),
                 expiry_slot,
@@ -655,9 +647,9 @@ async fn test_create_wallet() {
     );
     banks.process_transaction(tx).await.unwrap();
 
-    // Verify state
+    // Verify state. `read_wallet_state` calls `deserialize`, which rejects any
+    // byte other than `LAYOUT_VERSION`, so reaching this line implies version=1.
     let wallet = read_wallet_state(&mut banks, &wallet_pda).await;
-    assert_eq!(wallet.version, 1);
     assert_eq!(wallet.authorities[0].pubkey, compressed);
     assert_eq!(wallet.nonce, 0);
     assert_eq!(wallet.id(), keccak::hash(&compressed).to_bytes());
@@ -694,7 +686,6 @@ async fn test_create_wallet_ed25519() {
     banks.process_transaction(tx).await.unwrap();
 
     let wallet = read_wallet_state(&mut banks, &wallet_pda).await;
-    assert_eq!(wallet.version, 1);
     assert_eq!(wallet.authorities[0].sig_scheme, 1);
     assert_eq!(wallet.authorities[0].pubkey, authority_bytes);
     assert_eq!(wallet.authority_count, 1);
@@ -703,7 +694,8 @@ async fn test_create_wallet_ed25519() {
 #[tokio::test]
 async fn test_create_wallet_rejects_unsigned_ed25519_authority() {
     // A non-zero 32-byte value can pass the lightweight format check, but
-    // CreateWallet now requires a matching Ed25519 precompile proof.
+    // CreateWallet requires a matching Ed25519 precompile proof — a valid-format
+    // pubkey alone is not enough.
     let (banks, payer, recent_blockhash) = program_test().start().await;
     let mut authority = [0u8; 33];
     authority[0] = 1;
@@ -796,7 +788,6 @@ async fn test_add_authority_tops_up_rent_via_system_transfer() {
         &payer.pubkey(),
         &wallet_pda,
         0,
-        0,
         &new_owner_pubkey,
         0,
         u64::MAX,
@@ -815,7 +806,7 @@ async fn test_add_authority_tops_up_rent_via_system_transfer() {
     assert_eq!(wallet_after.authority_count, 2);
     assert_eq!(wallet_after.authorities[1].pubkey, new_owner_pubkey);
     assert!(account_after.lamports > account_before.lamports);
-    assert_eq!(account_after.data.len(), MachineWallet::v1_account_size(2));
+    assert_eq!(account_after.data.len(), MachineWallet::account_size(2));
 }
 
 #[tokio::test]
@@ -843,7 +834,6 @@ async fn test_add_ed25519_authority_succeeds() {
     let add_ix = build_add_authority_ix(
         &payer.pubkey(),
         &wallet_pda,
-        0,
         1, // new_sig_scheme = Ed25519
         &new_ed25519_bytes,
         0,
@@ -890,7 +880,6 @@ async fn test_remove_authority_keeps_excess_rent_in_wallet() {
                 &payer.pubkey(),
                 &wallet_pda,
                 0,
-                0,
                 &new_owner_pubkey,
                 0,
                 u64::MAX,
@@ -920,7 +909,6 @@ async fn test_remove_authority_keeps_excess_rent_in_wallet() {
                 &payer.pubkey(),
                 &wallet_pda,
                 0,
-                0,
                 &new_owner_pubkey,
                 0,
                 u64::MAX,
@@ -942,7 +930,7 @@ async fn test_remove_authority_keeps_excess_rent_in_wallet() {
     );
     assert_eq!(
         account_after_remove.data.len(),
-        MachineWallet::v1_account_size(1)
+        MachineWallet::account_size(1)
     );
 }
 
@@ -1088,7 +1076,7 @@ async fn test_create_wallet_succeeds_with_dusted_pda() {
 
     let account = banks.get_account(wallet_pda).await.unwrap().unwrap();
     assert_eq!(account.owner, machine_wallet::id());
-    assert_eq!(account.data.len(), MachineWallet::v1_account_size(1));
+    assert_eq!(account.data.len(), MachineWallet::account_size(1));
     assert!(account.lamports > 1);
 }
 
@@ -1285,7 +1273,6 @@ async fn test_close_wallet_invalidates_active_session() {
         &wallet_pda,
         &vault_pda,
         &destination,
-        0,
         u64::MAX,
     );
     let close_tx = Transaction::new_signed_with_payer(
@@ -1584,7 +1571,6 @@ async fn test_owner_close_session_reclaims_revoked_session_rent() {
                 &payer.pubkey(),
                 &wallet_pda,
                 &session_pda,
-                0,
                 u64::MAX,
                 &session_authority.pubkey(),
             ),
@@ -1617,7 +1603,6 @@ async fn test_owner_close_session_reclaims_revoked_session_rent() {
                 &payer.pubkey(),
                 &wallet_pda,
                 &session_pda,
-                0,
                 u64::MAX,
                 &session_authority.pubkey(),
                 &destination.pubkey(),
@@ -1699,7 +1684,6 @@ async fn test_execute_sol_transfer() {
         &payer.pubkey(),
         &wallet_pda,
         &vault_pda,
-        0,
         u64::MAX,
         &[inner],
         &[
@@ -1775,7 +1759,6 @@ async fn test_nonce_increment() {
             &payer.pubkey(),
             &wallet_pda,
             &vault_pda,
-            0,
             u64::MAX,
             &[inner],
             &[
@@ -1833,7 +1816,6 @@ async fn test_close_wallet() {
         &wallet_pda,
         &vault_pda,
         &destination,
-        0,
         u64::MAX,
     );
 
@@ -1915,7 +1897,6 @@ async fn test_execute_wrong_pubkey() {
         &payer.pubkey(),
         &wallet_pda,
         &vault_pda,
-        0,
         u64::MAX,
         &[inner],
         &[
@@ -1987,7 +1968,6 @@ async fn test_execute_wrong_nonce() {
         &payer.pubkey(),
         &wallet_pda,
         &vault_pda,
-        0,
         u64::MAX,
         &[inner],
         &[
@@ -2057,7 +2037,6 @@ async fn test_execute_replay() {
         &payer.pubkey(),
         &wallet_pda,
         &vault_pda,
-        0,
         u64::MAX,
         &[inner.clone()],
         &[
@@ -2082,7 +2061,6 @@ async fn test_execute_replay() {
         &payer.pubkey(),
         &wallet_pda,
         &vault_pda,
-        0,
         u64::MAX,
         &[inner],
         &[
@@ -2162,7 +2140,6 @@ async fn test_execute_modified_instructions() {
         &payer.pubkey(),
         &wallet_pda,
         &vault_pda,
-        0,
         u64::MAX,
         &[inner_modified],
         &[
@@ -2212,7 +2189,6 @@ async fn test_execute_wrong_vault() {
         &payer.pubkey(),
         &wallet_pda,
         &wrong_vault,
-        0,
         u64::MAX,
         &[inner],
         &[],
@@ -2237,7 +2213,6 @@ async fn test_execute_wallet_not_owned() {
     let fake_vault = Pubkey::new_unique();
 
     let mut data = vec![1u8]; // Execute discriminator
-    data.push(0); // secp256r1_ix_index
     data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_slot
     data.extend_from_slice(&0u32.to_le_bytes()); // 0 inner instructions
 
@@ -2272,8 +2247,7 @@ async fn test_execute_no_precompile() {
     let execute_ix = build_execute_ix(
         &payer.pubkey(),
         &wallet_pda,
-        &vault_pda,
-        0, // points to the execute ix itself (not a precompile)
+        &vault_pda, // points to the execute ix itself (not a precompile)
         u64::MAX,
         &[],
         &[],
@@ -2303,8 +2277,7 @@ async fn test_execute_precompile_index_out_of_bounds() {
     let execute_ix = build_execute_ix(
         &payer.pubkey(),
         &wallet_pda,
-        &vault_pda,
-        99, // way out of bounds
+        &vault_pda, // way out of bounds
         u64::MAX,
         &[],
         &[],
@@ -2337,7 +2310,6 @@ async fn test_close_wallet_not_owned() {
         &fake_wallet,
         &fake_vault,
         &destination,
-        0,
         u64::MAX,
     );
 
@@ -2378,7 +2350,6 @@ async fn test_close_wallet_wrong_pubkey() {
         &wallet_pda,
         &vault_pda,
         &destination,
-        0,
         u64::MAX,
     );
 
@@ -2424,7 +2395,6 @@ async fn test_close_wallet_wrong_destination() {
         &wallet_pda,
         &vault_pda,
         &attacker_destination,
-        0,
         u64::MAX,
     );
 
@@ -2654,10 +2624,9 @@ fn test_inner_hash_order_matters() {
 fn build_advance_nonce_ix(
     fee_payer: &Pubkey,
     wallet_pda: &Pubkey,
-    secp256r1_ix_index: u8,
     max_slot: u64,
 ) -> Instruction {
-    let mut data = vec![3u8, secp256r1_ix_index];
+    let mut data = vec![3u8];
     data.extend_from_slice(&max_slot.to_le_bytes());
     Instruction {
         program_id: machine_wallet::id(),
@@ -2704,7 +2673,7 @@ async fn test_advance_nonce() {
     let message =
         compute_advance_nonce_message(&wallet_pda, wallet_state.creation_slot, 0, u64::MAX);
     let precompile_ix = build_secp256r1_ix(&signing_key, &compressed, &message);
-    let advance_ix = build_advance_nonce_ix(&payer.pubkey(), &wallet_pda, 0, u64::MAX);
+    let advance_ix = build_advance_nonce_ix(&payer.pubkey(), &wallet_pda, u64::MAX);
 
     let recent_blockhash = banks.get_latest_blockhash().await.unwrap();
     let tx = Transaction::new_signed_with_payer(
@@ -2767,7 +2736,7 @@ async fn test_advance_nonce_invalidates_pending_execute() {
     let advance_message =
         compute_advance_nonce_message(&wallet_pda, wallet_state.creation_slot, 0, u64::MAX);
     let advance_precompile = build_secp256r1_ix(&signing_key, &compressed, &advance_message);
-    let advance_ix = build_advance_nonce_ix(&payer.pubkey(), &wallet_pda, 0, u64::MAX);
+    let advance_ix = build_advance_nonce_ix(&payer.pubkey(), &wallet_pda, u64::MAX);
 
     let recent_blockhash = banks.get_latest_blockhash().await.unwrap();
     let tx = Transaction::new_signed_with_payer(
@@ -2787,7 +2756,6 @@ async fn test_advance_nonce_invalidates_pending_execute() {
         &payer.pubkey(),
         &wallet_pda,
         &vault_pda,
-        0,
         u64::MAX,
         &[inner],
         &[
@@ -2823,7 +2791,7 @@ async fn test_advance_nonce_wrong_pubkey() {
     let message =
         compute_advance_nonce_message(&wallet_pda, wallet_state.creation_slot, 0, u64::MAX);
     let precompile_ix = build_secp256r1_ix(&signing_key_b, &compressed_b, &message);
-    let advance_ix = build_advance_nonce_ix(&payer.pubkey(), &wallet_pda, 0, u64::MAX);
+    let advance_ix = build_advance_nonce_ix(&payer.pubkey(), &wallet_pda, u64::MAX);
 
     let recent_blockhash = banks.get_latest_blockhash().await.unwrap();
     let tx = Transaction::new_signed_with_payer(
@@ -2844,7 +2812,7 @@ async fn test_advance_nonce_wallet_not_owned() {
     let (banks, payer, recent_blockhash) = program_test().start().await;
 
     let fake_wallet = payer.pubkey(); // system-owned
-    let advance_ix = build_advance_nonce_ix(&payer.pubkey(), &fake_wallet, 0, u64::MAX);
+    let advance_ix = build_advance_nonce_ix(&payer.pubkey(), &fake_wallet, u64::MAX);
 
     let tx = Transaction::new_signed_with_payer(
         &[advance_ix],
@@ -2908,7 +2876,6 @@ async fn test_execute_signature_expired() {
         &payer.pubkey(),
         &wallet_pda,
         &vault_pda,
-        0,
         0, // expired
         &[inner],
         &[
@@ -2954,7 +2921,6 @@ async fn test_close_wallet_signature_expired() {
         &wallet_pda,
         &vault_pda,
         &destination,
-        0,
         0, // expired
     );
 
@@ -2987,7 +2953,6 @@ async fn test_execute_rejects_empty_inner_instructions() {
         &payer.pubkey(),
         &wallet_pda,
         &vault_pda,
-        0,
         u64::MAX,
         &[], // empty
         &[],
@@ -3020,7 +2985,6 @@ async fn test_execute_wallet_not_owned_with_inner() {
         &payer.pubkey(),
         &fake_wallet,
         &fake_vault,
-        0,
         u64::MAX,
         &[inner],
         &[AccountMeta::new_readonly(Pubkey::new_unique(), false)],
@@ -3057,7 +3021,6 @@ async fn test_execute_cpi_to_self_denied() {
         &payer.pubkey(),
         &wallet_pda,
         &vault_pda,
-        0,
         u64::MAX,
         &[inner],
         &[AccountMeta::new_readonly(machine_wallet::id(), false)],
@@ -3128,7 +3091,6 @@ async fn test_execute_shared_precompile_in_same_tx() {
         &payer.pubkey(),
         &wallet_pda,
         &vault_pda,
-        0,
         u64::MAX,
         &[inner.clone()],
         &remaining_metas,
@@ -3136,8 +3098,7 @@ async fn test_execute_shared_precompile_in_same_tx() {
     let execute_ix2 = build_execute_ix(
         &payer.pubkey(),
         &wallet_pda,
-        &vault_pda,
-        0, // same precompile index
+        &vault_pda, // same precompile index
         u64::MAX,
         &[inner],
         &remaining_metas,
@@ -3173,8 +3134,7 @@ async fn test_close_wallet_destination_is_wallet_pda() {
         &payer.pubkey(),
         &wallet_pda,
         &vault_pda,
-        &wallet_pda, // destination == wallet!
-        0,
+        &wallet_pda,
         u64::MAX,
     );
 
@@ -3203,8 +3163,7 @@ async fn test_close_wallet_destination_is_vault_pda() {
         &payer.pubkey(),
         &wallet_pda,
         &vault_pda,
-        &vault_pda, // destination == vault!
-        0,
+        &vault_pda,
         u64::MAX,
     );
 
@@ -3246,7 +3205,6 @@ async fn test_close_wallet_empty_vault() {
         &wallet_pda,
         &vault_pda,
         &destination,
-        0,
         u64::MAX,
     );
 
@@ -3519,7 +3477,6 @@ async fn test_add_authority_duplicate_rejected() {
             build_add_authority_ix(
                 &payer.pubkey(),
                 &wallet_pda,
-                0,
                 1,
                 &owner_bytes,
                 0,
@@ -3564,7 +3521,6 @@ async fn test_add_authority_rejects_cross_scheme_pubkey_reuse() {
             build_add_authority_ix(
                 &payer.pubkey(),
                 &wallet_pda,
-                0,
                 machine_wallet::state::SIG_SCHEME_SECP256R1,
                 &compressed,
                 0,
@@ -3594,7 +3550,6 @@ async fn test_add_authority_rejects_cross_scheme_pubkey_reuse() {
             build_add_authority_ix(
                 &payer.pubkey(),
                 &wallet_pda,
-                0,
                 machine_wallet::state::SIG_SCHEME_WEBAUTHN,
                 &compressed,
                 0,
@@ -3636,7 +3591,6 @@ async fn test_remove_authority_last_rejected() {
             build_remove_authority_ix(
                 &payer.pubkey(),
                 &wallet_pda,
-                0,
                 1,
                 &owner_bytes,
                 0,
@@ -3661,11 +3615,10 @@ async fn test_remove_authority_last_rejected() {
 fn build_set_threshold_ix(
     fee_payer: &Pubkey,
     wallet_pda: &Pubkey,
-    precompile_ix_index: u8,
     new_threshold: u8,
     max_slot: u64,
 ) -> Instruction {
-    let mut data = vec![11u8, precompile_ix_index, new_threshold];
+    let mut data = vec![11u8, new_threshold];
     data.extend_from_slice(&max_slot.to_le_bytes());
 
     Instruction {
@@ -3703,7 +3656,7 @@ async fn test_set_threshold_succeeds() {
     let add_tx = Transaction::new_signed_with_payer(
         &[
             build_ed25519_precompile_ix(&owner, &add_msg),
-            build_add_authority_ix(&payer.pubkey(), &wallet_pda, 0, 0, &new_pubkey, 0, u64::MAX),
+            build_add_authority_ix(&payer.pubkey(), &wallet_pda, 0, &new_pubkey, 0, u64::MAX),
         ],
         Some(&payer.pubkey()),
         &[&payer],
@@ -3719,7 +3672,7 @@ async fn test_set_threshold_succeeds() {
     let tx = Transaction::new_signed_with_payer(
         &[
             build_ed25519_precompile_ix(&owner, &msg),
-            build_set_threshold_ix(&payer.pubkey(), &wallet_pda, 0, 2, u64::MAX),
+            build_set_threshold_ix(&payer.pubkey(), &wallet_pda, 2, u64::MAX),
         ],
         Some(&payer.pubkey()),
         &[&payer],
@@ -3748,7 +3701,7 @@ async fn test_set_threshold_exceeds_authority_count_rejected() {
     let tx = Transaction::new_signed_with_payer(
         &[
             build_ed25519_precompile_ix(&owner, &msg),
-            build_set_threshold_ix(&payer.pubkey(), &wallet_pda, 0, 2, u64::MAX),
+            build_set_threshold_ix(&payer.pubkey(), &wallet_pda, 2, u64::MAX),
         ],
         Some(&payer.pubkey()),
         &[&payer],
@@ -3776,7 +3729,7 @@ async fn test_set_threshold_zero_rejected() {
     let tx = Transaction::new_signed_with_payer(
         &[
             build_ed25519_precompile_ix(&owner, &msg),
-            build_set_threshold_ix(&payer.pubkey(), &wallet_pda, 0, 0, u64::MAX),
+            build_set_threshold_ix(&payer.pubkey(), &wallet_pda, 0, u64::MAX),
         ],
         Some(&payer.pubkey()),
         &[&payer],
@@ -4056,7 +4009,6 @@ async fn test_session_execute_rejects_revoked_session() {
                 &payer.pubkey(),
                 &wallet_pda,
                 &session_pda,
-                0,
                 u64::MAX,
                 &session_authority.pubkey(),
             ),
@@ -4569,7 +4521,6 @@ async fn test_create_session_rejects_zero_allowed_programs() {
         &payer.pubkey(),
         &wallet_pda,
         &session_pda,
-        0,
         u64::MAX,
         &session_authority.pubkey(),
         wallet.creation_slot + 500,
@@ -4624,7 +4575,6 @@ async fn test_create_session_rejects_past_expiry() {
         &payer.pubkey(),
         &wallet_pda,
         &session_pda,
-        0,
         u64::MAX,
         &session_authority.pubkey(),
         1,
@@ -4662,7 +4612,6 @@ async fn test_execute_system_owned_wallet_rejected() {
         &payer.pubkey(),
         &fake_wallet,
         &fake_vault,
-        0,
         u64::MAX,
         &[], // empty inner_instructions
         &[],
@@ -4821,7 +4770,7 @@ fn build_provide_webauthn_evidence_ix(auth_data: &[u8], client_data_json: &[u8])
     }
 }
 
-/// Create a v1 wallet whose sole authority is a WEBAUTHN (P-256) key.
+/// Create a wallet whose sole authority is a WEBAUTHN (P-256) key.
 async fn create_webauthn_wallet_helper(
     banks: &mut BanksClient,
     payer: &Keypair,
@@ -4906,7 +4855,6 @@ async fn test_execute_webauthn_no_precompile_rejected() {
         &payer.pubkey(),
         &wallet_pda,
         &vault_pda,
-        0, // secp256r1_ix_index — v1 wallet ignores this
         u64::MAX,
         &[inner],
         &[
@@ -4973,7 +4921,6 @@ async fn test_execute_webauthn_rejects_uv_clear() {
         &payer.pubkey(),
         &wallet_pda,
         &vault_pda,
-        0, // secp256r1_ix_index — ignored for v1 wallets
         u64::MAX,
         &[inner],
         &[
@@ -5042,7 +4989,6 @@ async fn test_execute_webauthn_rejects_wrong_type() {
         &payer.pubkey(),
         &wallet_pda,
         &vault_pda,
-        0, // secp256r1_ix_index — ignored for v1 wallets
         u64::MAX,
         &[inner],
         &[
@@ -5128,7 +5074,6 @@ async fn test_execute_webauthn_happy_path() {
         &payer.pubkey(),
         &wallet_pda,
         &vault_pda,
-        0, // secp256r1_ix_index — ignored for v1 wallets
         u64::MAX,
         &[inner],
         &[
@@ -5193,7 +5138,6 @@ async fn test_execute_webauthn_threshold_bypass_rejected() {
                 build_add_authority_ix(
                     &payer.pubkey(),
                     &wallet_pda,
-                    0,
                     machine_wallet::state::SIG_SCHEME_WEBAUTHN,
                     &wa_pubkey,
                     0,
@@ -5214,7 +5158,7 @@ async fn test_execute_webauthn_threshold_bypass_rejected() {
         .process_transaction(Transaction::new_signed_with_payer(
             &[
                 build_ed25519_precompile_ix(&owner, &set_msg),
-                build_set_threshold_ix(&payer.pubkey(), &wallet_pda, 0, 2, u64::MAX),
+                build_set_threshold_ix(&payer.pubkey(), &wallet_pda, 2, u64::MAX),
             ],
             Some(&payer.pubkey()),
             &[&payer],
@@ -5256,7 +5200,6 @@ async fn test_execute_webauthn_threshold_bypass_rejected() {
         &payer.pubkey(),
         &wallet_pda,
         &vault_pda,
-        0, // secp256r1_ix_index — ignored for v1 wallets
         u64::MAX,
         &[inner],
         &[
@@ -5337,7 +5280,6 @@ async fn test_execute_webauthn_mixed_sig_threshold_met() {
                 build_add_authority_ix(
                     &payer.pubkey(),
                     &wallet_pda,
-                    0,
                     machine_wallet::state::SIG_SCHEME_WEBAUTHN,
                     &wa_pubkey,
                     0,
@@ -5358,7 +5300,7 @@ async fn test_execute_webauthn_mixed_sig_threshold_met() {
         .process_transaction(Transaction::new_signed_with_payer(
             &[
                 build_ed25519_precompile_ix(&owner, &set_msg),
-                build_set_threshold_ix(&payer.pubkey(), &wallet_pda, 0, 2, u64::MAX),
+                build_set_threshold_ix(&payer.pubkey(), &wallet_pda, 2, u64::MAX),
             ],
             Some(&payer.pubkey()),
             &[&payer],
@@ -5403,7 +5345,6 @@ async fn test_execute_webauthn_mixed_sig_threshold_met() {
         &payer.pubkey(),
         &wallet_pda,
         &vault_pda,
-        0, // secp256r1_ix_index — ignored for v1 wallets
         u64::MAX,
         &[inner],
         &[
@@ -5472,7 +5413,6 @@ async fn test_execute_webauthn_expired_max_slot() {
         &payer.pubkey(),
         &wallet_pda,
         &vault_pda,
-        0, // secp256r1_ix_index — ignored for v1 wallets
         expired,
         &[inner],
         &[

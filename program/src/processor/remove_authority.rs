@@ -11,7 +11,7 @@ use solana_program::{
 
 use crate::{
     error::MachineWalletError,
-    state::{MachineWallet, AUTHORITY_SLOT_SIZE, SYSTEM_PROGRAM_ID, V1_HEADER_SIZE},
+    state::{MachineWallet, AUTHORITY_SLOT_SIZE, SYSTEM_PROGRAM_ID},
     threshold,
 };
 
@@ -45,11 +45,9 @@ pub fn compute_remove_authority_message(
     .to_bytes()
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn process(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
-    precompile_ix_index: u8,
     remove_sig_scheme: u8,
     remove_pubkey: [u8; 33],
     new_threshold: u8,
@@ -88,26 +86,17 @@ pub fn process(
         return Err(MachineWalletError::SignatureExpired.into());
     }
 
-    // 4. Load wallet state (works for both v0 and v1)
+    // 4. Load wallet state
     let data = wallet_account.try_borrow_data()?;
     let wallet = MachineWallet::deserialize_runtime(&data)?;
     drop(data);
 
-    // 5. Verify wallet PDA
-    let id = wallet.id();
-    let expected_wallet_pda = Pubkey::create_program_address(
-        &[MachineWallet::SEED_PREFIX, &id, &[wallet.bump]],
-        program_id,
-    )
-    .map_err(|_| MachineWalletError::InvalidWalletPDA)?;
-    if *wallet_account.key != expected_wallet_pda {
-        return Err(MachineWalletError::InvalidWalletPDA.into());
-    }
+    // 5. Verify wallet PDA.
+    super::verify_wallet_pda(wallet_account, &wallet, program_id)?;
 
     // 6. Constraints
 
-    // 6a. Cannot remove last authority — would permanently lock the wallet
-    // NOTE: v0 wallets naturally hit this constraint (authority_count == 1)
+    // 6a. Cannot remove last authority — would permanently lock the wallet.
     if wallet.authority_count <= 1 {
         return Err(MachineWalletError::CannotRemoveLastAuthority.into());
     }
@@ -147,44 +136,34 @@ pub fn process(
         new_threshold,
     );
 
-    // 8. Signature verification. v0 wallets cannot reach here (blocked by 6a),
-    //    but we use the unified path for consistency and future-proofing.
+    // 8. Signature verification.
     threshold::verify_wallet_signatures(
         instructions_sysvar,
         program_id,
         &wallet,
-        precompile_ix_index,
         &expected_message,
     )?;
 
-    // 9. State mutation
-    // Wallet must be v1 (v0 blocked by CannotRemoveLastAuthority above)
-    // Swap-remove: copy last slot over the removed slot, then realloc shrink
-    let new_size = MachineWallet::v1_account_size(new_count);
+    // 9. State mutation.
+    // Swap-remove: copy last slot over the removed slot, then realloc shrink.
+    let new_size = MachineWallet::account_size(new_count);
 
     {
         let mut data = wallet_account.try_borrow_mut_data()?;
 
-        // Swap-remove: overwrite removed slot with last slot (if not already last)
+        // Swap-remove: overwrite removed slot with last slot (if not already last).
+        // If remove_index == last_index, the slot is already at the tail and the
+        // resize below drops it.
         let last_index = count - 1;
         if remove_index != last_index {
-            let removed_offset = V1_HEADER_SIZE + remove_index * AUTHORITY_SLOT_SIZE;
-            let last_offset = V1_HEADER_SIZE + last_index * AUTHORITY_SLOT_SIZE;
-            // Copy last slot bytes into removed slot position
-            // We need to do this without overlapping borrows — use a temp buffer
-            let mut last_slot_bytes = [0u8; AUTHORITY_SLOT_SIZE];
-            last_slot_bytes.copy_from_slice(&data[last_offset..last_offset + AUTHORITY_SLOT_SIZE]);
-            data[removed_offset..removed_offset + AUTHORITY_SLOT_SIZE]
-                .copy_from_slice(&last_slot_bytes);
+            let removed_offset = MachineWallet::slot_offset(remove_index);
+            let last_offset = MachineWallet::slot_offset(last_index);
+            data.copy_within(last_offset..last_offset + AUTHORITY_SLOT_SIZE, removed_offset);
         }
-        // (if remove_index == last_index, the slot is already at the tail; realloc will drop it)
 
-        // Update authority_count
-        data[35] = new_count;
-
-        // Update threshold if requested
+        data[MachineWallet::AUTHORITY_COUNT_OFFSET] = new_count;
         if new_threshold != 0 {
-            data[34] = new_threshold;
+            data[MachineWallet::THRESHOLD_OFFSET] = new_threshold;
         }
 
         wallet.write_incremented_nonce(&mut data)?;

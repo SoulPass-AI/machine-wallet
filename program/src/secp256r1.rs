@@ -1,7 +1,4 @@
-use solana_program::{
-    account_info::AccountInfo, program_error::ProgramError, pubkey::Pubkey,
-    sysvar::instructions::load_instruction_at_checked,
-};
+use solana_program::{program_error::ProgramError, pubkey::Pubkey};
 
 use crate::error::MachineWalletError;
 
@@ -51,18 +48,6 @@ impl SignatureOffsets {
             message_instruction_index: u16::from_le_bytes([data[12], data[13]]),
         })
     }
-}
-
-/// Expected size of the signed message (keccak256 hash).
-const MESSAGE_SIZE: usize = 32;
-
-/// Result of verifying a secp256r1 precompile instruction.
-#[derive(Debug)]
-pub struct PrecompileVerifyResult {
-    /// The compressed P-256 public key (33 bytes).
-    pub pubkey: [u8; PUBKEY_SIZE],
-    /// The signed message (keccak256 hash, exactly 32 bytes).
-    pub message: [u8; MESSAGE_SIZE],
 }
 
 /// Shared header / offsets / pubkey validation used by both sized and
@@ -156,43 +141,6 @@ pub fn parse_precompile_data_any_len<'a>(
     Ok((pubkey, &data[msg_start..msg_end]))
 }
 
-/// Parse a secp256r1 precompile signing a fixed 32-byte message (keccak256 hash).
-pub fn parse_precompile_data(data: &[u8]) -> Result<PrecompileVerifyResult, ProgramError> {
-    let (pubkey, msg_slice) = parse_precompile_data_sized(data, MESSAGE_SIZE)?;
-    let mut message = [0u8; MESSAGE_SIZE];
-    message.copy_from_slice(msg_slice);
-    Ok(PrecompileVerifyResult { pubkey, message })
-}
-
-/// Verify the secp256r1 precompile instruction at the given index.
-///
-/// The precompile cannot be called via CPI — it must be a separate instruction in the
-/// transaction. If our program is executing, the precompile instruction already succeeded
-/// (Solana runtime verifies all precompile instructions before executing any program).
-///
-/// We load the instruction via sysvar introspection and verify:
-/// 1. Correct program ID (secp256r1 precompile)
-/// 2. Exactly 1 signature (Phase 0)
-/// 3. All data references point to the same instruction (instruction_index = 0xFFFF)
-/// 4. Valid compressed pubkey prefix (0x02 or 0x03)
-///
-/// Returns the extracted pubkey and signed message.
-pub fn verify_precompile_instruction(
-    instructions_sysvar: &AccountInfo,
-    precompile_ix_index: u8,
-) -> Result<PrecompileVerifyResult, ProgramError> {
-    // Load the instruction at the specified index from the sysvar
-    let ix = load_instruction_at_checked(precompile_ix_index as usize, instructions_sysvar)
-        .map_err(|_| MachineWalletError::InstructionMissing)?;
-
-    // Verify it's the secp256r1 precompile
-    if ix.program_id != SECP256R1_PROGRAM_ID {
-        return Err(MachineWalletError::InvalidPrecompileInstruction.into());
-    }
-
-    parse_precompile_data(&ix.data)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,7 +201,7 @@ mod tests {
         );
     }
 
-    // --- parse_precompile_data ---
+    // --- parse_precompile_data_sized (32-byte message path) ---
 
     /// Build a minimal valid secp256r1 precompile instruction payload.
     ///
@@ -298,9 +246,9 @@ mod tests {
         let message = [0x99u8; 32];
         let data = build_valid_payload(pubkey, message);
 
-        let result = parse_precompile_data(&data).unwrap();
-        assert_eq!(result.pubkey, pubkey);
-        assert_eq!(result.message, message);
+        let (parsed_pubkey, msg_slice) = parse_precompile_data_sized(&data, 32).unwrap();
+        assert_eq!(parsed_pubkey, pubkey);
+        assert_eq!(msg_slice, &message[..]);
     }
 
     #[test]
@@ -310,7 +258,7 @@ mod tests {
         let mut data = build_valid_payload(pubkey, [0u8; 32]);
         data[0] = 0; // signature_count = 0
         assert_eq!(
-            parse_precompile_data(&data).unwrap_err(),
+            parse_precompile_data_sized(&data, 32).unwrap_err(),
             ProgramError::Custom(MachineWalletError::InvalidPrecompileInstruction as u32)
         );
     }
@@ -322,7 +270,7 @@ mod tests {
         let mut data = build_valid_payload(pubkey, [0u8; 32]);
         data[0] = 2; // signature_count = 2
         assert_eq!(
-            parse_precompile_data(&data).unwrap_err(),
+            parse_precompile_data_sized(&data, 32).unwrap_err(),
             ProgramError::Custom(MachineWalletError::InvalidPrecompileInstruction as u32)
         );
     }
@@ -337,7 +285,7 @@ mod tests {
         data[12] = wrong_size.to_le_bytes()[0];
         data[13] = wrong_size.to_le_bytes()[1];
         assert_eq!(
-            parse_precompile_data(&data).unwrap_err(),
+            parse_precompile_data_sized(&data, 32).unwrap_err(),
             ProgramError::Custom(MachineWalletError::MessageMismatch as u32)
         );
     }
@@ -348,7 +296,7 @@ mod tests {
         pubkey[0] = 0x04; // uncompressed prefix — invalid for compressed
         let data = build_valid_payload(pubkey, [0u8; 32]);
         assert_eq!(
-            parse_precompile_data(&data).unwrap_err(),
+            parse_precompile_data_sized(&data, 32).unwrap_err(),
             ProgramError::Custom(MachineWalletError::PublicKeyMismatch as u32)
         );
     }
@@ -362,7 +310,7 @@ mod tests {
         data[4] = 0x00;
         data[5] = 0x00; // instruction_index = 0 instead of 0xFFFF
         assert_eq!(
-            parse_precompile_data(&data).unwrap_err(),
+            parse_precompile_data_sized(&data, 32).unwrap_err(),
             ProgramError::Custom(MachineWalletError::InvalidPrecompileInstruction as u32)
         );
     }
@@ -370,6 +318,6 @@ mod tests {
     #[test]
     fn test_parse_precompile_data_rejects_too_short() {
         let data = [1u8; 5]; // shorter than HEADER_SIZE + SIGNATURE_OFFSETS_SIZE
-        assert!(parse_precompile_data(&data).is_err());
+        assert!(parse_precompile_data_sized(&data, 32).is_err());
     }
 }

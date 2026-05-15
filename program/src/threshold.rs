@@ -366,14 +366,10 @@ fn match_authority(
 
 /// Unified wallet signature verification.
 ///
-/// v0 wallets (single SECP256R1 authority, legacy): verifies one secp256r1
-/// precompile instruction at `precompile_ix_index` against the stored authority.
-///
-/// v1 wallets: scans the transaction for every scheme-appropriate evidence
-/// contribution — SECP256R1/ED25519 precompile instructions directly, and
-/// WEBAUTHN via paired precompile + ProvideWebAuthnEvidence sidecar
-/// (see `verify_threshold_signatures` for the algorithm). `precompile_ix_index`
-/// is ignored on v1.
+/// Scans the transaction for every scheme-appropriate evidence contribution —
+/// SECP256R1/ED25519 precompile instructions directly, and WEBAUTHN via paired
+/// precompile + ProvideWebAuthnEvidence sidecar (see `verify_threshold_signatures`
+/// for the algorithm).
 ///
 /// This is the single entry point for every wallet-authorized operation. Future
 /// signature schemes (post-quantum, etc.) extend this by:
@@ -387,20 +383,8 @@ pub fn verify_wallet_signatures(
     instructions_sysvar: &AccountInfo,
     program_id: &Pubkey,
     wallet: &MachineWallet,
-    precompile_ix_index: u8,
     expected_message: &[u8; 32],
 ) -> Result<(), ProgramError> {
-    if wallet.version == 0 {
-        let result =
-            secp256r1::verify_precompile_instruction(instructions_sysvar, precompile_ix_index)?;
-        if result.pubkey != wallet.authorities[0].pubkey {
-            return Err(MachineWalletError::PublicKeyMismatch.into());
-        }
-        if result.message != *expected_message {
-            return Err(MachineWalletError::MessageMismatch.into());
-        }
-        return Ok(());
-    }
     verify_threshold_signatures(
         instructions_sysvar,
         program_id,

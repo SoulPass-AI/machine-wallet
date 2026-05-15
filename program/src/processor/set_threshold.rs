@@ -40,7 +40,6 @@ pub fn compute_set_threshold_message(
 pub fn process(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
-    precompile_ix_index: u8,
     new_threshold: u8,
     max_slot: u64,
 ) -> ProgramResult {
@@ -73,21 +72,13 @@ pub fn process(
         return Err(MachineWalletError::SignatureExpired.into());
     }
 
-    // 4. Load wallet state (works for both v0 and v1)
+    // 4. Load wallet state.
     let data = wallet_account.try_borrow_data()?;
     let wallet = MachineWallet::deserialize_runtime(&data)?;
     drop(data);
 
-    // 5. Verify wallet PDA
-    let id = wallet.id();
-    let expected_wallet_pda = Pubkey::create_program_address(
-        &[MachineWallet::SEED_PREFIX, &id, &[wallet.bump]],
-        program_id,
-    )
-    .map_err(|_| MachineWalletError::InvalidWalletPDA)?;
-    if *wallet_account.key != expected_wallet_pda {
-        return Err(MachineWalletError::InvalidWalletPDA.into());
-    }
+    // 5. Verify wallet PDA.
+    super::verify_wallet_pda(wallet_account, &wallet, program_id)?;
 
     // 6. Validate new_threshold: must be >= 1 and <= authority_count
     if new_threshold < 1 || new_threshold > wallet.authority_count {
@@ -108,16 +99,12 @@ pub fn process(
         instructions_sysvar,
         program_id,
         &wallet,
-        precompile_ix_index,
         &expected_message,
     )?;
 
-    // 9. Update threshold byte and bump nonce. Threshold sits at byte 35 in v0
-    //    (after the header-level sig_scheme), byte 34 in v1; nonce write is
-    //    delegated to the version-aware helper.
+    // 9. Update threshold byte and bump nonce.
     let mut data = wallet_account.try_borrow_mut_data()?;
-    let threshold_off = if wallet.version == 0 { 35 } else { 34 };
-    data[threshold_off] = new_threshold;
+    data[MachineWallet::THRESHOLD_OFFSET] = new_threshold;
     wallet.write_incremented_nonce(&mut data)?;
 
     Ok(())

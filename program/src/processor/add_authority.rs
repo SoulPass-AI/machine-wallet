@@ -15,8 +15,8 @@ use solana_system_interface::instruction as system_instruction;
 use crate::{
     error::MachineWalletError,
     state::{
-        AuthoritySlot, MachineWallet, AUTHORITY_SLOT_SIZE, SIG_SCHEME_ED25519,
-        SIG_SCHEME_SECP256R1, SYSTEM_PROGRAM_ID, V1_HEADER_SIZE,
+        AuthoritySlot, MachineWallet, SIG_SCHEME_ED25519,
+        SIG_SCHEME_SECP256R1, SYSTEM_PROGRAM_ID,
     },
     threshold,
 };
@@ -51,11 +51,9 @@ pub fn compute_add_authority_message(
     .to_bytes()
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn process(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
-    precompile_ix_index: u8,
     new_sig_scheme: u8,
     new_pubkey: [u8; 33],
     new_threshold: u8,
@@ -94,21 +92,13 @@ pub fn process(
         return Err(MachineWalletError::SignatureExpired.into());
     }
 
-    // 4. Load wallet state (works for both v0 and v1)
+    // 4. Load wallet state
     let data = wallet_account.try_borrow_data()?;
     let wallet = MachineWallet::deserialize_runtime(&data)?;
     drop(data);
 
-    // 5. Verify wallet PDA
-    let id = wallet.id();
-    let expected_wallet_pda = Pubkey::create_program_address(
-        &[MachineWallet::SEED_PREFIX, &id, &[wallet.bump]],
-        program_id,
-    )
-    .map_err(|_| MachineWalletError::InvalidWalletPDA)?;
-    if *wallet_account.key != expected_wallet_pda {
-        return Err(MachineWalletError::InvalidWalletPDA.into());
-    }
+    // 5. Verify wallet PDA.
+    super::verify_wallet_pda(wallet_account, &wallet, program_id)?;
 
     // 6. Constraints
     // 6a. Authority count limit
@@ -168,84 +158,25 @@ pub fn process(
         instructions_sysvar,
         program_id,
         &wallet,
-        precompile_ix_index,
         &expected_message,
     )?;
 
-    // 9. State mutation
-    if wallet.version == 0 {
-        // ── v0 → v1 migration ──
-        // The wallet is loaded as v0, but we are constructing a fresh v1 buffer
-        // here, so `write_incremented_nonce` (which uses the wallet's own version)
-        // cannot be used; the nonce must be written at the v1 offset directly.
-        // All v0 fields are already in `wallet` from deserialize_runtime above.
-        // Defense-in-depth: v0 must have exactly 1 authority
-        if wallet.authority_count != 1 {
-            return Err(ProgramError::InvalidAccountData);
-        }
-        let new_nonce = wallet
-            .nonce
-            .checked_add(1)
-            .ok_or(MachineWalletError::InvalidNonce)?;
+    // 9. Append the new authority slot, growing the account by one slot.
+    let new_size = MachineWallet::account_size(new_count);
+    realloc_with_rent(wallet_account, fee_payer, system_program, new_size)?;
 
-        // Realloc to v1 size for 2 authorities
-        let new_size = MachineWallet::v1_account_size(2);
-        realloc_with_rent(wallet_account, fee_payer, system_program, new_size)?;
+    let mut data = wallet_account.try_borrow_mut_data()?;
 
-        // Write v1 layout
-        let mut data = wallet_account.try_borrow_mut_data()?;
-        data[0] = 1; // version = 1
-                     // [1..34] unchanged (bump, wallet_id)
+    let new_slot_offset = MachineWallet::slot_offset(count);
+    data[new_slot_offset] = new_sig_scheme;
+    data[new_slot_offset + 1..new_slot_offset + 1 + 33].copy_from_slice(&new_pubkey);
 
-        let effective_threshold = if new_threshold != 0 {
-            new_threshold
-        } else {
-            wallet.threshold
-        };
-        data[34] = effective_threshold;
-        data[35] = 2; // authority_count = 2
-
-        // Write nonce (incremented)
-        data[MachineWallet::V1_NONCE_OFFSET..MachineWallet::V1_NONCE_OFFSET + 8]
-            .copy_from_slice(&new_nonce.to_le_bytes());
-        // Write creation_slot (preserved from v0)
-        data[MachineWallet::V1_CREATION_SLOT_OFFSET..MachineWallet::V1_CREATION_SLOT_OFFSET + 8]
-            .copy_from_slice(&wallet.creation_slot.to_le_bytes());
-        // Write vault_bump
-        data[MachineWallet::V1_VAULT_BUMP_OFFSET] = wallet.vault_bump;
-
-        // Authority slot 0: original authority
-        let slot0_offset = V1_HEADER_SIZE;
-        data[slot0_offset] = wallet.authorities[0].sig_scheme;
-        data[slot0_offset + 1..slot0_offset + 1 + 33]
-            .copy_from_slice(&wallet.authorities[0].pubkey);
-
-        // Authority slot 1: new authority
-        let slot1_offset = V1_HEADER_SIZE + AUTHORITY_SLOT_SIZE;
-        data[slot1_offset] = new_sig_scheme;
-        data[slot1_offset + 1..slot1_offset + 1 + 33].copy_from_slice(&new_pubkey);
-    } else {
-        // ── v1 append ──
-        let new_size = MachineWallet::v1_account_size(new_count);
-        realloc_with_rent(wallet_account, fee_payer, system_program, new_size)?;
-
-        let mut data = wallet_account.try_borrow_mut_data()?;
-
-        // Write new authority slot at end
-        let new_slot_offset = V1_HEADER_SIZE + count * AUTHORITY_SLOT_SIZE;
-        data[new_slot_offset] = new_sig_scheme;
-        data[new_slot_offset + 1..new_slot_offset + 1 + 33].copy_from_slice(&new_pubkey);
-
-        // Update authority_count
-        data[35] = new_count;
-
-        // Update threshold if requested
-        if new_threshold != 0 {
-            data[34] = new_threshold;
-        }
-
-        wallet.write_incremented_nonce(&mut data)?;
+    data[MachineWallet::AUTHORITY_COUNT_OFFSET] = new_count;
+    if new_threshold != 0 {
+        data[MachineWallet::THRESHOLD_OFFSET] = new_threshold;
     }
+
+    wallet.write_incremented_nonce(&mut data)?;
 
     Ok(())
 }

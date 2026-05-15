@@ -1,7 +1,8 @@
 use solana_program::{keccak, program_error::ProgramError};
 
-/// SessionState version byte. Must remain 0 — wallet state uses version 1+,
-/// so this value also serves as a discriminator between account types.
+/// SessionState version byte. Must remain 0 — wallet state uses
+/// `MachineWallet::LAYOUT_VERSION` (≥1), so this value also serves as a
+/// discriminator between account types.
 pub const SESSION_STATE_VERSION: u8 = 0;
 
 /// System program ID (11111111111111111111111111111111).
@@ -20,14 +21,11 @@ pub const SIG_SCHEME_ED25519: u8 = 1;
 /// Uses the same P-256 key format as SECP256R1, but with WebAuthn message wrapping.
 pub const SIG_SCHEME_WEBAUTHN: u8 = 2;
 
-/// Maximum number of authorities in a multi-authority wallet.
+/// Maximum number of authorities per wallet.
 pub const MAX_AUTHORITIES: u8 = 16;
 
 /// Size of a single AuthoritySlot: 1 (scheme) + 33 (pubkey).
 pub const AUTHORITY_SLOT_SIZE: usize = 34;
-
-/// V1 fixed header size: version(1) + bump(1) + wallet_id(32) + threshold(1) + authority_count(1) + nonce(8) + creation_slot(8) + vault_bump(1) = 53
-pub const V1_HEADER_SIZE: usize = 53;
 
 /// Single authority entry: signature scheme + compressed public key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,22 +74,8 @@ impl AuthoritySlot {
 
 /// MachineWallet on-chain state.
 ///
-/// Supports two on-chain layouts:
-///
-/// **V0 Layout (87 bytes, single authority):**
-/// - version:         u8       (offset 0)   = 0
-/// - bump:            u8       (offset 1)
-/// - wallet_id:       [u8; 32] (offset 2)
-/// - sig_scheme:      u8       (offset 34)  — header-level, single scheme
-/// - threshold:       u8       (offset 35)
-/// - authority_count: u8       (offset 36)
-/// - authority:       [u8; 33] (offset 37)
-/// - nonce:           u64      (offset 70)
-/// - creation_slot:   u64      (offset 78)
-/// - vault_bump:      u8       (offset 86)
-///
-/// **V1 Layout (53 + N*34 bytes, multi-authority):**
-/// - version:         u8       (offset 0)   = 1
+/// Layout (53 + N×34 bytes, where N = authority_count):
+/// - version:         u8       (offset 0)   = `LAYOUT_VERSION`
 /// - bump:            u8       (offset 1)
 /// - wallet_id:       [u8; 32] (offset 2)
 /// - threshold:       u8       (offset 34)
@@ -99,10 +83,15 @@ impl AuthoritySlot {
 /// - nonce:           u64      (offset 36)
 /// - creation_slot:   u64      (offset 44)
 /// - vault_bump:      u8       (offset 52)
-/// - authorities:     [AuthoritySlot; N] (offset 53), N = authority_count
+/// - authorities:     [AuthoritySlot; N] (offset 53)
+///
+/// Each `AuthoritySlot` carries its own `sig_scheme`, so one wallet can mix
+/// Secp256r1, Ed25519, and WebAuthn signers.
+///
+/// The version byte lives only on disk; `deserialize` enforces
+/// `data[0] == LAYOUT_VERSION`, so the in-memory struct carries no copy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MachineWallet {
-    pub version: u8,
     pub bump: u8,
     pub wallet_id: [u8; 32],
     pub threshold: u8,
@@ -114,26 +103,26 @@ pub struct MachineWallet {
 }
 
 impl MachineWallet {
-    /// Total serialized size in bytes for v0 (fixed part, single authority).
-    pub const LEN: usize = 1 + 1 + 32 + 1 + 1 + 1 + 33 + 8 + 8 + 1; // 87
+    /// On-chain layout version byte. `serialize` writes it into `data[0]`,
+    /// `deserialize_*` requires equality, and any future migration bumps this
+    /// constant in one place.
+    pub const LAYOUT_VERSION: u8 = 1;
 
-    // --- V0 offsets (kept for backward compatibility and migration) ---
+    /// Fixed header size before the authority slots:
+    /// version(1) + bump(1) + wallet_id(32) + threshold(1) + authority_count(1)
+    /// + nonce(8) + creation_slot(8) + vault_bump(1) = 53.
+    pub const HEADER_SIZE: usize = 53;
 
-    /// Byte offset of the nonce field within v0 serialized state.
-    pub const V0_NONCE_OFFSET: usize = 70;
-    /// Byte offset of the creation_slot field within v0 serialized state.
-    pub const V0_CREATION_SLOT_OFFSET: usize = 78;
-    /// Byte offset of the vault_bump field within v0 serialized state.
-    pub const V0_VAULT_BUMP_OFFSET: usize = 86;
-
-    // --- V1 offsets ---
-
-    /// Byte offset of the nonce field within v1 serialized state.
-    pub const V1_NONCE_OFFSET: usize = 36;
-    /// Byte offset of the creation_slot field within v1 serialized state.
-    pub const V1_CREATION_SLOT_OFFSET: usize = 44;
-    /// Byte offset of the vault_bump field within v1 serialized state.
-    pub const V1_VAULT_BUMP_OFFSET: usize = 52;
+    /// Byte offset of the threshold field within the serialized layout.
+    pub const THRESHOLD_OFFSET: usize = 34;
+    /// Byte offset of the authority_count field within the serialized layout.
+    pub const AUTHORITY_COUNT_OFFSET: usize = 35;
+    /// Byte offset of the nonce field within the serialized layout.
+    pub const NONCE_OFFSET: usize = 36;
+    /// Byte offset of the creation_slot field within the serialized layout.
+    pub const CREATION_SLOT_OFFSET: usize = 44;
+    /// Byte offset of the vault_bump field within the serialized layout.
+    pub const VAULT_BUMP_OFFSET: usize = 52;
 
     /// Wallet PDA seed prefix.
     pub const SEED_PREFIX: &'static [u8] = b"machine_wallet";
@@ -141,51 +130,39 @@ impl MachineWallet {
     /// Vault PDA seed prefix.
     pub const VAULT_SEED_PREFIX: &'static [u8] = b"machine_vault";
 
-    /// Version-aware nonce offset.
-    pub fn nonce_offset(&self) -> usize {
-        match self.version {
-            0 => Self::V0_NONCE_OFFSET,
-            _ => Self::V1_NONCE_OFFSET,
-        }
-    }
-
-    /// Increment the nonce in a serialized wallet buffer using the version-aware
-    /// offset. Single point of change for nonce-bump semantics across every
-    /// state-mutating processor.
-    ///
-    /// Not used by:
-    /// - CloseWallet: also bumps creation_slot in the same write, so the two
-    ///   field writes stay co-located (see close_wallet.rs step 12).
-    /// - AddAuthority v0→v1 migration: the wallet is loaded as v0, but the
-    ///   buffer being written is the new v1 layout — this helper would write at
-    ///   the v0 offset and corrupt the migrated state.
+    /// Increment the nonce in a serialized wallet buffer. Single point of
+    /// change for nonce-bump semantics across every state-mutating processor.
     pub fn write_incremented_nonce(&self, data: &mut [u8]) -> Result<(), ProgramError> {
         let new_nonce = self
             .nonce
             .checked_add(1)
             .ok_or(crate::error::MachineWalletError::InvalidNonce)?;
-        let off = self.nonce_offset();
-        if data.len() < off + 8 {
+        if data.len() < Self::NONCE_OFFSET + 8 {
             return Err(ProgramError::AccountDataTooSmall);
         }
-        data[off..off + 8].copy_from_slice(&new_nonce.to_le_bytes());
+        data[Self::NONCE_OFFSET..Self::NONCE_OFFSET + 8]
+            .copy_from_slice(&new_nonce.to_le_bytes());
         Ok(())
     }
 
-    /// Version-aware creation_slot offset.
-    pub fn creation_slot_offset(&self) -> usize {
-        match self.version {
-            0 => Self::V0_CREATION_SLOT_OFFSET,
-            _ => Self::V1_CREATION_SLOT_OFFSET,
+    /// Increment the creation_slot field. CloseWallet bumps this so any
+    /// pre-existing session — whose `wallet_creation_slot` snapshot now
+    /// mismatches — fails the SessionExecute check and cannot drain residual
+    /// assets after a close.
+    pub fn write_incremented_creation_slot(
+        &self,
+        data: &mut [u8],
+    ) -> Result<(), ProgramError> {
+        let new_creation_slot = self
+            .creation_slot
+            .checked_add(1)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+        if data.len() < Self::CREATION_SLOT_OFFSET + 8 {
+            return Err(ProgramError::AccountDataTooSmall);
         }
-    }
-
-    /// Version-aware vault_bump offset.
-    pub fn vault_bump_offset(&self) -> usize {
-        match self.version {
-            0 => Self::V0_VAULT_BUMP_OFFSET,
-            _ => Self::V1_VAULT_BUMP_OFFSET,
-        }
+        data[Self::CREATION_SLOT_OFFSET..Self::CREATION_SLOT_OFFSET + 8]
+            .copy_from_slice(&new_creation_slot.to_le_bytes());
+        Ok(())
     }
 
     /// Return the stored wallet ID (set at creation, never changes).
@@ -200,68 +177,47 @@ impl MachineWallet {
         keccak::hash(authority).to_bytes()
     }
 
-    /// Calculate the required account size for a v1 wallet with the given authority count.
-    pub fn v1_account_size(authority_count: u8) -> usize {
-        V1_HEADER_SIZE + authority_count as usize * AUTHORITY_SLOT_SIZE
+    /// Calculate the required account size for a wallet with the given authority count.
+    pub fn account_size(authority_count: u8) -> usize {
+        Self::HEADER_SIZE + authority_count as usize * AUTHORITY_SLOT_SIZE
     }
 
-    /// Serialize v0 layout into a byte buffer (must be at least LEN bytes).
+    /// Byte offset of the i-th authority slot within the serialized layout.
+    #[inline(always)]
+    pub const fn slot_offset(i: usize) -> usize {
+        Self::HEADER_SIZE + i * AUTHORITY_SLOT_SIZE
+    }
+
+    /// Serialize wallet state into a byte buffer.
     pub fn serialize(&self, dst: &mut [u8]) -> Result<(), ProgramError> {
-        if dst.len() < Self::LEN {
-            return Err(ProgramError::AccountDataTooSmall);
-        }
-        dst[0] = self.version;
-        dst[1] = self.bump;
-        dst[2..34].copy_from_slice(&self.wallet_id);
-        // v0: sig_scheme at offset 34 from first authority slot
-        dst[34] = self.authorities[0].sig_scheme;
-        dst[35] = self.threshold;
-        dst[36] = self.authority_count;
-        dst[37..70].copy_from_slice(&self.authorities[0].pubkey);
-        dst[Self::V0_NONCE_OFFSET..Self::V0_NONCE_OFFSET + 8]
-            .copy_from_slice(&self.nonce.to_le_bytes());
-        dst[Self::V0_CREATION_SLOT_OFFSET..Self::V0_CREATION_SLOT_OFFSET + 8]
-            .copy_from_slice(&self.creation_slot.to_le_bytes());
-        dst[Self::V0_VAULT_BUMP_OFFSET] = self.vault_bump;
-        Ok(())
-    }
-
-    /// Serialize v1 layout into a byte buffer.
-    pub fn serialize_v1(&self, dst: &mut [u8]) -> Result<(), ProgramError> {
-        let required = Self::v1_account_size(self.authority_count);
+        let required = Self::account_size(self.authority_count);
         if dst.len() < required {
             return Err(ProgramError::AccountDataTooSmall);
         }
-        dst[0] = self.version;
+        dst[0] = Self::LAYOUT_VERSION;
         dst[1] = self.bump;
         dst[2..34].copy_from_slice(&self.wallet_id);
-        dst[34] = self.threshold;
-        dst[35] = self.authority_count;
-        dst[Self::V1_NONCE_OFFSET..Self::V1_NONCE_OFFSET + 8]
+        dst[Self::THRESHOLD_OFFSET] = self.threshold;
+        dst[Self::AUTHORITY_COUNT_OFFSET] = self.authority_count;
+        dst[Self::NONCE_OFFSET..Self::NONCE_OFFSET + 8]
             .copy_from_slice(&self.nonce.to_le_bytes());
-        dst[Self::V1_CREATION_SLOT_OFFSET..Self::V1_CREATION_SLOT_OFFSET + 8]
+        dst[Self::CREATION_SLOT_OFFSET..Self::CREATION_SLOT_OFFSET + 8]
             .copy_from_slice(&self.creation_slot.to_le_bytes());
-        dst[Self::V1_VAULT_BUMP_OFFSET] = self.vault_bump;
-        // Write authority slots
+        dst[Self::VAULT_BUMP_OFFSET] = self.vault_bump;
         for i in 0..self.authority_count as usize {
-            let offset = V1_HEADER_SIZE + i * AUTHORITY_SLOT_SIZE;
+            let offset = Self::slot_offset(i);
             dst[offset] = self.authorities[i].sig_scheme;
             dst[offset + 1..offset + 1 + 33].copy_from_slice(&self.authorities[i].pubkey);
         }
         Ok(())
     }
 
-    /// Deserialize v0 layout (existing 87-byte single-authority format).
-    fn deserialize_v0(src: &[u8], validate: bool) -> Result<Self, ProgramError> {
-        // Exact-length equality (not `<`): rejects trailing bytes so a single
-        // byte string cannot deserialize into multiple valid v0 representations.
-        if src.len() != Self::LEN {
+    fn deserialize_inner(src: &[u8], validate: bool) -> Result<Self, ProgramError> {
+        if src.len() < Self::HEADER_SIZE {
             return Err(ProgramError::AccountDataTooSmall);
         }
 
-        let version = src[0];
-        // v0 must have version == 0
-        if version != 0 {
+        if src[0] != Self::LAYOUT_VERSION {
             return Err(ProgramError::InvalidAccountData);
         }
 
@@ -270,80 +226,8 @@ impl MachineWallet {
         let mut wallet_id = [0u8; 32];
         wallet_id.copy_from_slice(&src[2..34]);
 
-        let sig_scheme = src[34];
-        if sig_scheme != SIG_SCHEME_SECP256R1 {
-            return Err(ProgramError::InvalidAccountData);
-        }
-        let threshold = src[35];
-        let authority_count = src[36];
-        // V0 layout has exactly one authority slot (87 bytes fixed).
-        // Enforce this invariant even though we are the only writer.
-        if authority_count != 1 || threshold != 1 {
-            return Err(ProgramError::InvalidAccountData);
-        }
-
-        let mut pubkey = [0u8; 33];
-        pubkey.copy_from_slice(&src[37..70]);
-
-        // Length already validated ≥ 87; these slices are guaranteed 8 bytes.
-        let nonce = u64::from_le_bytes(
-            src[Self::V0_NONCE_OFFSET..Self::V0_NONCE_OFFSET + 8]
-                .try_into()
-                .unwrap(),
-        );
-
-        let creation_slot = u64::from_le_bytes(
-            src[Self::V0_CREATION_SLOT_OFFSET..Self::V0_CREATION_SLOT_OFFSET + 8]
-                .try_into()
-                .unwrap(),
-        );
-
-        let vault_bump = src[Self::V0_VAULT_BUMP_OFFSET];
-
-        // Wrap single authority into AuthoritySlot
-        let mut authorities = [AuthoritySlot::EMPTY; MAX_AUTHORITIES as usize];
-        authorities[0] = AuthoritySlot { sig_scheme, pubkey };
-
-        let wallet = Self {
-            version,
-            bump,
-            wallet_id,
-            threshold,
-            authority_count,
-            authorities,
-            nonce,
-            creation_slot,
-            vault_bump,
-        };
-
-        if validate {
-            // Validate the single authority (P-256 curve point decompression)
-            if !authorities[0].is_valid() {
-                return Err(ProgramError::InvalidAccountData);
-            }
-        }
-
-        Ok(wallet)
-    }
-
-    /// Deserialize v1 layout (multi-authority format).
-    fn deserialize_v1(src: &[u8], validate: bool) -> Result<Self, ProgramError> {
-        if src.len() < V1_HEADER_SIZE {
-            return Err(ProgramError::AccountDataTooSmall);
-        }
-
-        let version = src[0];
-        if version != 1 {
-            return Err(ProgramError::InvalidAccountData);
-        }
-
-        let bump = src[1];
-
-        let mut wallet_id = [0u8; 32];
-        wallet_id.copy_from_slice(&src[2..34]);
-
-        let threshold = src[34];
-        let authority_count = src[35];
+        let threshold = src[Self::THRESHOLD_OFFSET];
+        let authority_count = src[Self::AUTHORITY_COUNT_OFFSET];
 
         if threshold == 0 || authority_count == 0 {
             return Err(ProgramError::InvalidAccountData);
@@ -356,32 +240,36 @@ impl MachineWallet {
         }
 
         // Exact-length equality rejects trailing bytes. Combined with the
-        // realloc path that always sizes to `v1_account_size(authority_count)`,
+        // realloc path that always sizes to `account_size(authority_count)`,
         // this means the on-chain account byte-length must mirror the
         // declared `authority_count` — no stale-slot shadowing possible.
-        let required_size = Self::v1_account_size(authority_count);
+        let required_size = Self::account_size(authority_count);
         if src.len() != required_size {
             return Err(ProgramError::AccountDataTooSmall);
         }
 
         // Length already validated ≥ required_size; these slices are guaranteed 8 bytes.
         let nonce = u64::from_le_bytes(
-            src[Self::V1_NONCE_OFFSET..Self::V1_NONCE_OFFSET + 8]
+            src[Self::NONCE_OFFSET..Self::NONCE_OFFSET + 8]
                 .try_into()
                 .unwrap(),
         );
 
         let creation_slot = u64::from_le_bytes(
-            src[Self::V1_CREATION_SLOT_OFFSET..Self::V1_CREATION_SLOT_OFFSET + 8]
+            src[Self::CREATION_SLOT_OFFSET..Self::CREATION_SLOT_OFFSET + 8]
                 .try_into()
                 .unwrap(),
         );
 
-        let vault_bump = src[Self::V1_VAULT_BUMP_OFFSET];
+        let vault_bump = src[Self::VAULT_BUMP_OFFSET];
 
         let mut authorities = [AuthoritySlot::EMPTY; MAX_AUTHORITIES as usize];
-        for i in 0..authority_count as usize {
-            let offset = V1_HEADER_SIZE + i * AUTHORITY_SLOT_SIZE;
+        for (i, slot) in authorities
+            .iter_mut()
+            .take(authority_count as usize)
+            .enumerate()
+        {
+            let offset = Self::slot_offset(i);
             let sig_scheme = src[offset];
             // Runtime-path validation of sig_scheme: only the three declared
             // schemes are accepted for active slots. An unknown value would
@@ -395,21 +283,14 @@ impl MachineWallet {
             {
                 return Err(ProgramError::InvalidAccountData);
             }
-            let mut pubkey = [0u8; 33];
-            pubkey.copy_from_slice(&src[offset + 1..offset + 1 + 33]);
-            authorities[i] = AuthoritySlot { sig_scheme, pubkey };
-        }
-
-        if validate {
-            for i in 0..authority_count as usize {
-                if !authorities[i].is_valid() {
-                    return Err(ProgramError::InvalidAccountData);
-                }
+            slot.sig_scheme = sig_scheme;
+            slot.pubkey.copy_from_slice(&src[offset + 1..offset + 1 + 33]);
+            if validate && !slot.is_valid() {
+                return Err(ProgramError::InvalidAccountData);
             }
         }
 
         Ok(Self {
-            version,
             bump,
             wallet_id,
             threshold,
@@ -421,18 +302,14 @@ impl MachineWallet {
         })
     }
 
-    /// Deserialize from a byte buffer with full integrity checks.
-    ///
-    /// Dispatches by version byte. Validates authority pubkeys.
+    /// Deserialize from a byte buffer with full integrity checks (validates
+    /// authority pubkeys). `deserialize_inner` enforces version byte equality
+    /// against `LAYOUT_VERSION`, so any unknown byte fails closed.
     pub fn deserialize(src: &[u8]) -> Result<Self, ProgramError> {
         if src.is_empty() {
             return Err(ProgramError::AccountDataTooSmall);
         }
-        match src[0] {
-            0 => Self::deserialize_v0(src, true),
-            1 => Self::deserialize_v1(src, true),
-            _ => Err(ProgramError::InvalidAccountData),
-        }
+        Self::deserialize_inner(src, true)
     }
 
     /// Deserialize for runtime hot paths.
@@ -445,21 +322,7 @@ impl MachineWallet {
         if src.is_empty() {
             return Err(ProgramError::AccountDataTooSmall);
         }
-        match src[0] {
-            0 => Self::deserialize_v0(src, false),
-            1 => Self::deserialize_v1(src, false),
-            _ => Err(ProgramError::InvalidAccountData),
-        }
-    }
-
-    /// Lightweight format check on the first authority pubkey (test-only).
-    /// Processors use `AuthoritySlot::is_valid()` which handles all schemes.
-    #[cfg(test)]
-    pub fn validate_authority(&self) -> Result<(), ProgramError> {
-        if !Self::is_valid_authority(&self.authorities[0].pubkey) {
-            return Err(ProgramError::InvalidAccountData);
-        }
-        Ok(())
+        Self::deserialize_inner(src, false)
     }
 
     /// Lightweight P-256 compressed pubkey format check.
@@ -783,32 +646,13 @@ mod tests {
         }
     }
 
-    fn make_wallet(prefix: u8) -> MachineWallet {
-        let auth = make_p256_authority(prefix);
-        let wallet_id = MachineWallet::compute_id(&auth.pubkey);
-        let mut authorities = [AuthoritySlot::EMPTY; MAX_AUTHORITIES as usize];
-        authorities[0] = auth;
-        MachineWallet {
-            version: 0,
-            bump: 254,
-            wallet_id,
-            threshold: 1,
-            authority_count: 1,
-            authorities,
-            nonce: 0x0102030405060708,
-            creation_slot: 42,
-            vault_bump: 253,
-        }
-    }
-
-    fn make_v1_wallet(authority_count: u8, authorities: &[AuthoritySlot]) -> MachineWallet {
+    fn make_wallet(authority_count: u8, authorities: &[AuthoritySlot]) -> MachineWallet {
         let wallet_id = MachineWallet::compute_id(&authorities[0].pubkey);
         let mut auth_arr = [AuthoritySlot::EMPTY; MAX_AUTHORITIES as usize];
         for (i, a) in authorities.iter().enumerate() {
             auth_arr[i] = *a;
         }
         MachineWallet {
-            version: 1,
             bump: 254,
             wallet_id,
             threshold: 1,
@@ -818,44 +662,6 @@ mod tests {
             creation_slot: 42,
             vault_bump: 253,
         }
-    }
-
-    // ==================== V0 Tests (unchanged behavior) ====================
-
-    #[test]
-    fn test_wallet_size() {
-        assert_eq!(MachineWallet::LEN, 87);
-    }
-
-    #[test]
-    fn test_wallet_roundtrip() {
-        let wallet = make_wallet(0x02);
-        let mut buf = [0u8; MachineWallet::LEN];
-        wallet.serialize(&mut buf).unwrap();
-
-        let decoded = MachineWallet::deserialize(&buf).unwrap();
-        assert_eq!(wallet, decoded);
-        assert_eq!(decoded.version, 0);
-        assert_eq!(decoded.bump, 254);
-        assert_eq!(
-            decoded.wallet_id,
-            MachineWallet::compute_id(&decoded.authorities[0].pubkey)
-        );
-        assert_eq!(decoded.authorities[0].sig_scheme, SIG_SCHEME_SECP256R1);
-        assert_eq!(decoded.threshold, 1);
-        assert_eq!(decoded.authority_count, 1);
-        assert_eq!(decoded.authorities[0].pubkey[0], 0x02);
-        assert_eq!(decoded.nonce, 0x0102030405060708);
-        assert_eq!(decoded.creation_slot, 42);
-        assert_eq!(decoded.vault_bump, 253);
-    }
-
-    #[test]
-    fn test_wallet_id_stored() {
-        let wallet = make_wallet(0x02);
-        let expected_id = keccak::hash(&wallet.authorities[0].pubkey).to_bytes();
-        assert_eq!(wallet.id(), expected_id);
-        assert_eq!(wallet.wallet_id, expected_id);
     }
 
     #[test]
@@ -868,191 +674,15 @@ mod tests {
     }
 
     #[test]
-    fn test_wallet_roundtrip_prefix_03() {
-        let wallet = make_wallet(0x03);
-        let mut buf = [0u8; MachineWallet::LEN];
-        wallet.serialize(&mut buf).unwrap();
-
-        let decoded = MachineWallet::deserialize(&buf).unwrap();
-        assert_eq!(decoded.authorities[0].pubkey[0], 0x03);
-        decoded.validate_authority().unwrap();
-    }
-
-    #[test]
-    fn test_wallet_invalid_version() {
-        let wallet = make_wallet(0x02);
-        let mut buf = [0u8; MachineWallet::LEN];
-        wallet.serialize(&mut buf).unwrap();
-
-        buf[0] = 99; // invalid version (neither 0 nor 1)
-        let result = MachineWallet::deserialize(&buf);
-        assert_eq!(result.unwrap_err(), ProgramError::InvalidAccountData);
-    }
-
-    #[test]
-    fn test_wallet_too_short() {
-        let buf = [0u8; 50];
-        let result = MachineWallet::deserialize(&buf);
-        assert_eq!(result.unwrap_err(), ProgramError::AccountDataTooSmall);
-    }
-
-    #[test]
-    fn test_wallet_serialize_too_short() {
-        let wallet = make_wallet(0x02);
-        let mut buf = [0u8; 50];
-        let result = wallet.serialize(&mut buf);
-        assert_eq!(result.unwrap_err(), ProgramError::AccountDataTooSmall);
-    }
-
-    #[test]
-    fn test_wallet_invalid_pubkey_prefix() {
-        let mut wallet = make_wallet(0x02);
-        wallet.authorities[0].pubkey[0] = 0x04;
-        let result = wallet.validate_authority();
-        assert_eq!(result.unwrap_err(), ProgramError::InvalidAccountData);
-    }
-
-    #[test]
-    fn test_wallet_invalid_pubkey_prefix_zero() {
-        let mut wallet = make_wallet(0x02);
-        wallet.authorities[0].pubkey[0] = 0x00;
-        let result = wallet.validate_authority();
-        assert_eq!(result.unwrap_err(), ProgramError::InvalidAccountData);
-    }
-
-    #[test]
-    fn test_wallet_off_curve_point_accepted_by_format_check() {
-        // Lightweight format check accepts valid-format but off-curve points.
-        // Full curve validation is deferred to the Secp256r1 precompile at signing time.
-        let mut wallet = make_wallet(0x02);
-        let mut authority = [0xFFu8; 33];
-        authority[0] = 0x02;
-        wallet.authorities[0].pubkey = authority;
-        wallet.validate_authority().unwrap(); // format is valid → accepted
-    }
-
-    #[test]
-    fn test_wallet_rejects_zero_x_coordinate() {
-        let mut wallet = make_wallet(0x02);
-        let mut authority = [0u8; 33];
-        authority[0] = 0x02; // valid prefix but x = 0
-        wallet.authorities[0].pubkey = authority;
-        let result = wallet.validate_authority();
-        assert_eq!(result.unwrap_err(), ProgramError::InvalidAccountData);
-    }
-
-    #[test]
-    fn test_wallet_valid_pubkey_prefixes() {
-        make_wallet(0x02).validate_authority().unwrap();
-        make_wallet(0x03).validate_authority().unwrap();
-    }
-
-    #[test]
-    fn test_wallet_runtime_deserialize_skips_expensive_integrity_checks() {
-        // Runtime deserialize doesn't validate authority
-        let mut wallet = make_wallet(0x02);
-        wallet.authorities[0].pubkey = [0xFF; 33]; // invalid authority
-        let mut buf = [0u8; MachineWallet::LEN];
-        wallet.serialize(&mut buf).unwrap();
-
-        let decoded = MachineWallet::deserialize_runtime(&buf).unwrap();
-        assert_eq!(decoded.authorities[0].pubkey, wallet.authorities[0].pubkey);
-    }
-
-    #[test]
-    fn test_wallet_rejects_invalid_sig_scheme() {
-        let wallet = make_wallet(0x02);
-        let mut buf = [0u8; MachineWallet::LEN];
-        wallet.serialize(&mut buf).unwrap();
-        buf[34] = 5; // invalid sig_scheme
-        let result = MachineWallet::deserialize(&buf);
-        assert_eq!(result.unwrap_err(), ProgramError::InvalidAccountData);
-    }
-
-    #[test]
-    fn test_wallet_rejects_zero_threshold() {
-        let wallet = make_wallet(0x02);
-        let mut buf = [0u8; MachineWallet::LEN];
-        wallet.serialize(&mut buf).unwrap();
-        buf[35] = 0; // zero threshold
-        let result = MachineWallet::deserialize(&buf);
-        assert_eq!(result.unwrap_err(), ProgramError::InvalidAccountData);
-    }
-
-    #[test]
-    fn test_wallet_rejects_zero_authority_count() {
-        let wallet = make_wallet(0x02);
-        let mut buf = [0u8; MachineWallet::LEN];
-        wallet.serialize(&mut buf).unwrap();
-        buf[36] = 0; // zero authority_count
-        let result = MachineWallet::deserialize(&buf);
-        assert_eq!(result.unwrap_err(), ProgramError::InvalidAccountData);
-    }
-
-    #[test]
-    fn test_wallet_nonce_max_roundtrip() {
-        let mut wallet = make_wallet(0x02);
-        wallet.nonce = u64::MAX;
-        let mut buf = [0u8; MachineWallet::LEN];
-        wallet.serialize(&mut buf).unwrap();
-        let decoded = MachineWallet::deserialize(&buf).unwrap();
-        assert_eq!(decoded.nonce, u64::MAX);
-    }
-
-    #[test]
-    fn test_wallet_creation_slot_max_roundtrip() {
-        let mut wallet = make_wallet(0x02);
-        wallet.creation_slot = u64::MAX;
-        let mut buf = [0u8; MachineWallet::LEN];
-        wallet.serialize(&mut buf).unwrap();
-        let decoded = MachineWallet::deserialize(&buf).unwrap();
-        assert_eq!(decoded.creation_slot, u64::MAX);
-    }
-
-    #[test]
-    fn test_wallet_runtime_deserialize_still_rejects_invalid_sig_scheme() {
-        let wallet = make_wallet(0x02);
-        let mut buf = [0u8; MachineWallet::LEN];
-        wallet.serialize(&mut buf).unwrap();
-        buf[34] = 1; // invalid sig_scheme for v0 (Ed25519 not allowed in v0 header)
-                     // Runtime deserialize also validates sig_scheme for v0
-        let result = MachineWallet::deserialize_runtime(&buf);
-        assert_eq!(result.unwrap_err(), ProgramError::InvalidAccountData);
-    }
-
-    #[test]
-    fn test_wallet_runtime_deserialize_still_rejects_zero_threshold() {
-        let wallet = make_wallet(0x02);
-        let mut buf = [0u8; MachineWallet::LEN];
-        wallet.serialize(&mut buf).unwrap();
-        buf[35] = 0; // zero threshold
-        let result = MachineWallet::deserialize_runtime(&buf);
-        assert_eq!(result.unwrap_err(), ProgramError::InvalidAccountData);
-    }
-
-    #[test]
-    fn test_wallet_runtime_deserialize_still_rejects_invalid_version() {
-        let wallet = make_wallet(0x02);
-        let mut buf = [0u8; MachineWallet::LEN];
-        wallet.serialize(&mut buf).unwrap();
-        buf[0] = 9;
-
-        let result = MachineWallet::deserialize_runtime(&buf);
-        assert_eq!(result.unwrap_err(), ProgramError::InvalidAccountData);
-    }
-
-    // ==================== V1 Tests ====================
-
-    #[test]
-    fn test_v1_roundtrip_single_authority() {
+    fn test_roundtrip_single_authority() {
         let auth = make_p256_authority(0x02);
-        let wallet = make_v1_wallet(1, &[auth]);
-        let size = MachineWallet::v1_account_size(1);
+        let wallet = make_wallet(1, &[auth]);
+        let size = MachineWallet::account_size(1);
         let mut buf = vec![0u8; size];
-        wallet.serialize_v1(&mut buf).unwrap();
+        wallet.serialize(&mut buf).unwrap();
 
         let decoded = MachineWallet::deserialize(&buf).unwrap();
-        assert_eq!(decoded.version, 1);
+        assert_eq!(buf[0], MachineWallet::LAYOUT_VERSION);
         assert_eq!(decoded.bump, 254);
         assert_eq!(decoded.threshold, 1);
         assert_eq!(decoded.authority_count, 1);
@@ -1063,19 +693,19 @@ mod tests {
     }
 
     #[test]
-    fn test_v1_roundtrip_three_authorities_mixed() {
+    fn test_roundtrip_three_authorities_mixed() {
         let auth0 = make_p256_authority(0x02);
         let auth1 = make_ed25519_authority(0xAA);
         let auth2 = make_p256_authority(0x03);
-        let mut wallet = make_v1_wallet(3, &[auth0, auth1, auth2]);
+        let mut wallet = make_wallet(3, &[auth0, auth1, auth2]);
         wallet.threshold = 2;
 
-        let size = MachineWallet::v1_account_size(3);
+        let size = MachineWallet::account_size(3);
         let mut buf = vec![0u8; size];
-        wallet.serialize_v1(&mut buf).unwrap();
+        wallet.serialize(&mut buf).unwrap();
 
         let decoded = MachineWallet::deserialize(&buf).unwrap();
-        assert_eq!(decoded.version, 1);
+        assert_eq!(buf[0], MachineWallet::LAYOUT_VERSION);
         assert_eq!(decoded.threshold, 2);
         assert_eq!(decoded.authority_count, 3);
         assert_eq!(decoded.authorities[0], auth0);
@@ -1087,7 +717,7 @@ mod tests {
     }
 
     #[test]
-    fn test_v1_roundtrip_max_authorities() {
+    fn test_roundtrip_max_authorities() {
         let mut auths = Vec::new();
         for i in 0..MAX_AUTHORITIES {
             if i % 2 == 0 {
@@ -1096,12 +726,12 @@ mod tests {
                 auths.push(make_ed25519_authority(i + 1));
             }
         }
-        let mut wallet = make_v1_wallet(MAX_AUTHORITIES, &auths);
+        let mut wallet = make_wallet(MAX_AUTHORITIES, &auths);
         wallet.threshold = MAX_AUTHORITIES;
 
-        let size = MachineWallet::v1_account_size(MAX_AUTHORITIES);
+        let size = MachineWallet::account_size(MAX_AUTHORITIES);
         let mut buf = vec![0u8; size];
-        wallet.serialize_v1(&mut buf).unwrap();
+        wallet.serialize(&mut buf).unwrap();
 
         let decoded = MachineWallet::deserialize(&buf).unwrap();
         assert_eq!(decoded.authority_count, MAX_AUTHORITIES);
@@ -1112,14 +742,12 @@ mod tests {
     }
 
     #[test]
-    fn test_v1_rejects_zero_authority_count() {
+    fn test_rejects_zero_authority_count() {
         let auth = make_p256_authority(0x02);
-        let wallet = make_v1_wallet(1, &[auth]);
-
-        // Manually construct buffer and override authority_count to 0
-        let size = MachineWallet::v1_account_size(1); // still need space
+        let wallet = make_wallet(1, &[auth]);
+        let size = MachineWallet::account_size(1);
         let mut buf = vec![0u8; size];
-        wallet.serialize_v1(&mut buf).unwrap();
+        wallet.serialize(&mut buf).unwrap();
         buf[35] = 0; // zero authority_count
 
         let result = MachineWallet::deserialize(&buf);
@@ -1127,12 +755,12 @@ mod tests {
     }
 
     #[test]
-    fn test_v1_rejects_zero_threshold() {
+    fn test_rejects_zero_threshold() {
         let auth = make_p256_authority(0x02);
-        let wallet = make_v1_wallet(1, &[auth]);
-        let size = MachineWallet::v1_account_size(1);
+        let wallet = make_wallet(1, &[auth]);
+        let size = MachineWallet::account_size(1);
         let mut buf = vec![0u8; size];
-        wallet.serialize_v1(&mut buf).unwrap();
+        wallet.serialize(&mut buf).unwrap();
         buf[34] = 0; // zero threshold
 
         let result = MachineWallet::deserialize(&buf);
@@ -1140,12 +768,12 @@ mod tests {
     }
 
     #[test]
-    fn test_v1_rejects_threshold_exceeds_authority_count() {
+    fn test_rejects_threshold_exceeds_authority_count() {
         let auth = make_p256_authority(0x02);
-        let wallet = make_v1_wallet(1, &[auth]);
-        let size = MachineWallet::v1_account_size(1);
+        let wallet = make_wallet(1, &[auth]);
+        let size = MachineWallet::account_size(1);
         let mut buf = vec![0u8; size];
-        wallet.serialize_v1(&mut buf).unwrap();
+        wallet.serialize(&mut buf).unwrap();
         buf[34] = 2; // threshold > authority_count (1)
 
         let result = MachineWallet::deserialize(&buf);
@@ -1153,20 +781,46 @@ mod tests {
     }
 
     #[test]
-    fn test_v1_account_size() {
-        assert_eq!(MachineWallet::v1_account_size(1), 53 + 34); // 87
-        assert_eq!(MachineWallet::v1_account_size(2), 53 + 68); // 121
-        assert_eq!(MachineWallet::v1_account_size(3), 53 + 102); // 155
-        assert_eq!(MachineWallet::v1_account_size(16), 53 + 544); // 597
+    fn test_account_size() {
+        assert_eq!(MachineWallet::account_size(1), 53 + 34); // 87
+        assert_eq!(MachineWallet::account_size(2), 53 + 68); // 121
+        assert_eq!(MachineWallet::account_size(3), 53 + 102); // 155
+        assert_eq!(MachineWallet::account_size(16), 53 + 544); // 597
     }
 
     #[test]
-    fn test_v1_serialize_too_short() {
+    fn test_serialize_too_short() {
         let auth = make_p256_authority(0x02);
-        let wallet = make_v1_wallet(1, &[auth]);
+        let wallet = make_wallet(1, &[auth]);
         let mut buf = [0u8; 50]; // too small
-        let result = wallet.serialize_v1(&mut buf);
+        let result = wallet.serialize(&mut buf);
         assert_eq!(result.unwrap_err(), ProgramError::AccountDataTooSmall);
+    }
+
+    #[test]
+    fn test_wallet_id_stored() {
+        let auth = make_p256_authority(0x02);
+        let wallet = make_wallet(1, &[auth]);
+        let expected_id = keccak::hash(&wallet.authorities[0].pubkey).to_bytes();
+        assert_eq!(wallet.id(), expected_id);
+        assert_eq!(wallet.wallet_id, expected_id);
+    }
+
+    #[test]
+    fn test_rejects_invalid_version() {
+        let auth = make_p256_authority(0x02);
+        let wallet = make_wallet(1, &[auth]);
+        let mut buf = vec![0u8; MachineWallet::account_size(1)];
+        wallet.serialize(&mut buf).unwrap();
+        buf[0] = 99; // unknown version
+        assert_eq!(
+            MachineWallet::deserialize(&buf).unwrap_err(),
+            ProgramError::InvalidAccountData
+        );
+        assert_eq!(
+            MachineWallet::deserialize_runtime(&buf).unwrap_err(),
+            ProgramError::InvalidAccountData
+        );
     }
 
     // ==================== AuthoritySlot Validation ====================
@@ -1229,77 +883,29 @@ mod tests {
         assert!(!auth.is_valid());
     }
 
-    // ==================== Version-Aware Offset Methods ====================
-
     #[test]
-    fn test_version_aware_offsets_v0() {
-        let wallet = make_wallet(0x02);
-        assert_eq!(wallet.nonce_offset(), 70);
-        assert_eq!(wallet.creation_slot_offset(), 78);
-        assert_eq!(wallet.vault_bump_offset(), 86);
-    }
-
-    #[test]
-    fn test_version_aware_offsets_v1() {
-        let auth = make_p256_authority(0x02);
-        let wallet = make_v1_wallet(1, &[auth]);
-        assert_eq!(wallet.nonce_offset(), 36);
-        assert_eq!(wallet.creation_slot_offset(), 44);
-        assert_eq!(wallet.vault_bump_offset(), 52);
-    }
-
-    // ==================== deserialize_runtime for both versions ====================
-
-    #[test]
-    fn test_v0_runtime_deserialize() {
-        let wallet = make_wallet(0x02);
-        let mut buf = [0u8; MachineWallet::LEN];
-        wallet.serialize(&mut buf).unwrap();
-        let decoded = MachineWallet::deserialize_runtime(&buf).unwrap();
-        assert_eq!(decoded.version, 0);
-        assert_eq!(decoded.nonce, wallet.nonce);
-    }
-
-    #[test]
-    fn test_v1_runtime_deserialize() {
-        let auth = make_p256_authority(0x02);
-        let wallet = make_v1_wallet(1, &[auth]);
-        let size = MachineWallet::v1_account_size(1);
-        let mut buf = vec![0u8; size];
-        wallet.serialize_v1(&mut buf).unwrap();
-
-        let decoded = MachineWallet::deserialize_runtime(&buf).unwrap();
-        assert_eq!(decoded.version, 1);
-        assert_eq!(decoded.authority_count, 1);
-        assert_eq!(decoded.nonce, wallet.nonce);
-    }
-
-    #[test]
-    fn test_v1_runtime_deserialize_skips_validation() {
-        // Invalid P-256 key should pass runtime deserialize (no validation)
+    fn test_runtime_deserialize_skips_validation() {
+        // Invalid P-256 key should pass runtime deserialize (no validation),
+        // but full deserialize must still reject.
         let mut auth = make_p256_authority(0x02);
-        auth.pubkey = [0xFF; 33]; // invalid
-        let wallet = make_v1_wallet(1, &[auth]);
-        let size = MachineWallet::v1_account_size(1);
-        let mut buf = vec![0u8; size];
-        wallet.serialize_v1(&mut buf).unwrap();
+        auth.pubkey = [0xFF; 33];
+        let wallet = make_wallet(1, &[auth]);
+        let mut buf = vec![0u8; MachineWallet::account_size(1)];
+        wallet.serialize(&mut buf).unwrap();
 
-        // Runtime should succeed (skips validation)
         let decoded = MachineWallet::deserialize_runtime(&buf).unwrap();
         assert_eq!(decoded.authorities[0].pubkey, [0xFF; 33]);
 
-        // Full deserialize should fail (validates)
         let result = MachineWallet::deserialize(&buf);
         assert_eq!(result.unwrap_err(), ProgramError::InvalidAccountData);
     }
 
     #[test]
-    fn test_v1_deserialize_too_short_for_authorities() {
+    fn test_deserialize_too_short_for_authorities() {
         let auth = make_p256_authority(0x02);
-        let wallet = make_v1_wallet(1, &[auth]);
-        let size = MachineWallet::v1_account_size(1);
-        let mut buf = vec![0u8; size];
-        wallet.serialize_v1(&mut buf).unwrap();
+        let wallet = make_wallet(1, &[auth]);
+        let mut buf = vec![0u8; MachineWallet::account_size(1)];
+        wallet.serialize(&mut buf).unwrap();
         // Claim 3 authorities but buffer is only sized for 1
         buf[35] = 3;
 
@@ -1308,12 +914,12 @@ mod tests {
     }
 
     #[test]
-    fn test_v1_rejects_authority_count_exceeds_max() {
+    fn test_rejects_authority_count_exceeds_max() {
         let auth = make_p256_authority(0x02);
-        let wallet = make_v1_wallet(1, &[auth]);
-        // Create a big enough buffer
-        let mut buf = vec![0u8; V1_HEADER_SIZE + 17 * AUTHORITY_SLOT_SIZE];
-        wallet.serialize_v1(&mut buf).unwrap();
+        let wallet = make_wallet(1, &[auth]);
+        // Buffer large enough to claim authority_count = 17
+        let mut buf = vec![0u8; MachineWallet::HEADER_SIZE + 17 * AUTHORITY_SLOT_SIZE];
+        wallet.serialize(&mut buf).unwrap();
         buf[35] = 17; // exceeds MAX_AUTHORITIES (16)
 
         let result = MachineWallet::deserialize(&buf);

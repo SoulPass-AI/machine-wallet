@@ -38,7 +38,6 @@ pub fn compute_advance_nonce_message(
 pub fn process(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
-    secp256r1_ix_index: u8,
     max_slot: u64,
 ) -> ProgramResult {
     let account_iter = &mut accounts.iter();
@@ -78,16 +77,8 @@ pub fn process(
     let wallet = MachineWallet::deserialize_runtime(&data)?;
     drop(data);
 
-    // 6. Verify wallet PDA using cached bump (id computed from authority, ~100 CU syscall)
-    let id = wallet.id();
-    let expected_wallet_pda = Pubkey::create_program_address(
-        &[MachineWallet::SEED_PREFIX, &id, &[wallet.bump]],
-        program_id,
-    )
-    .map_err(|_| MachineWalletError::InvalidWalletPDA)?;
-    if *wallet_account.key != expected_wallet_pda {
-        return Err(MachineWalletError::InvalidWalletPDA.into());
-    }
+    // 6. Verify wallet PDA using cached bump.
+    super::verify_wallet_pda(wallet_account, &wallet, program_id)?;
 
     // 7. Compute expected message (zero-alloc via hashv)
     let expected_message = compute_advance_nonce_message(
@@ -102,7 +93,6 @@ pub fn process(
         instructions_sysvar,
         program_id,
         &wallet,
-        secp256r1_ix_index,
         &expected_message,
     )?;
 
