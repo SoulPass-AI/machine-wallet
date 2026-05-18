@@ -28,7 +28,10 @@ use machine_wallet::{
     processor::owner_close_session,
     processor::remove_authority::compute_remove_authority_message,
     processor::revoke_session,
-    state::{MachineWallet, SessionState, MAX_ALLOWED_PROGRAMS, SESSION_SEED_PREFIX},
+    state::{
+        MachineWallet, SessionState, MAX_ALLOWED_PROGRAMS, MAX_EPHEMERAL_SIGNERS,
+        SESSION_SEED_PREFIX,
+    },
 };
 
 use p256::ecdsa::{signature::Signer as P256Signer, SigningKey};
@@ -5350,6 +5353,528 @@ async fn test_execute_webauthn_expired_max_slot() {
             machine_wallet::error::MachineWalletError::SignatureExpired as u32
         ),
         "expected SignatureExpired, got {:?}",
+        err
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ExecuteWithEphemeralSigners (disc=16) — v1 execute path.
+//
+// These tests exercise `process_with_ephemeral_signers` end-to-end. They cover
+// the happy path (createAccount via ephemeral signer) plus the three failure
+// modes that the on-chain runtime must reject:
+//   - `EphemeralSignerKeyMismatch` when an inner-ix slot carries
+//     FLAG_EPHEMERAL_SIGNER but the supplied pubkey isn't a derived PDA.
+//   - `InvalidEphemeralSignerBump` when the caller-supplied bump produces an
+//     on-curve point.
+//   - disc=1 (v0) rejects FLAG_EPHEMERAL_SIGNER unconditionally because the v0
+//     handler passes empty ephemeral lists into `execute_cpi_loop`.
+// ---------------------------------------------------------------------------
+
+/// Off-chain mirror of `build_message_hash(EXECUTE_TAG_V1, …, [bumps_len, bumps], inner_hash)`.
+/// Inlined rather than imported because the v1 tag and `build_message_hash` are
+/// private to the processor.
+fn compute_message_hash_v1(
+    wallet_address: &Pubkey,
+    creation_slot: u64,
+    nonce: u64,
+    max_slot: u64,
+    bumps: &[u8],
+    inner_hash: &[u8; 32],
+) -> [u8; 32] {
+    let mut msg = Vec::with_capacity(25 + 32 + 8 + 8 + 8 + 1 + bumps.len() + 32);
+    msg.extend_from_slice(b"machine_wallet_execute_v1");
+    msg.extend_from_slice(wallet_address.as_ref());
+    msg.extend_from_slice(&creation_slot.to_le_bytes());
+    msg.extend_from_slice(&nonce.to_le_bytes());
+    msg.extend_from_slice(&max_slot.to_le_bytes());
+    msg.push(bumps.len() as u8);
+    msg.extend_from_slice(bumps);
+    msg.extend_from_slice(inner_hash);
+    keccak::hash(&msg).to_bytes()
+}
+
+fn build_execute_v1_ix(
+    fee_payer: &Pubkey,
+    wallet_pda: &Pubkey,
+    vault_pda: &Pubkey,
+    max_slot: u64,
+    bumps: &[u8],
+    inner_instructions: &[InnerInstruction],
+    remaining_account_metas: &[AccountMeta],
+) -> Instruction {
+    let mut data = vec![16u8]; // discriminator = ExecuteWithEphemeralSigners
+    data.extend_from_slice(&max_slot.to_le_bytes());
+    data.push(bumps.len() as u8);
+    data.extend_from_slice(bumps);
+    data.extend_from_slice(&(inner_instructions.len() as u32).to_le_bytes());
+    for inner in inner_instructions {
+        data.extend_from_slice(&inner.program_id);
+        data.extend_from_slice(&(inner.accounts.len() as u16).to_le_bytes());
+        data.extend_from_slice(&(inner.data.len() as u16).to_le_bytes());
+        for entry in &inner.accounts {
+            data.push(entry.index);
+            data.push(entry.flags);
+        }
+        data.extend_from_slice(&inner.data);
+    }
+
+    let mut accounts = vec![
+        AccountMeta::new_readonly(sysvar::instructions::id(), false),
+        AccountMeta::new(*wallet_pda, false),
+        AccountMeta::new_readonly(*fee_payer, true),
+        AccountMeta::new(*vault_pda, false),
+    ];
+    accounts.extend_from_slice(remaining_account_metas);
+
+    Instruction {
+        program_id: machine_wallet::id(),
+        accounts,
+        data,
+    }
+}
+
+/// Derive the canonical (off-curve) ephemeral signer PDA at `(wallet, nonce, index)`.
+fn derive_ephemeral_signer(wallet_pda: &Pubkey, nonce: u64, index: u8) -> (Pubkey, u8) {
+    let nonce_bytes = nonce.to_le_bytes();
+    let idx = [index];
+    Pubkey::find_program_address(
+        &[
+            MachineWallet::EPHEMERAL_SIGNER_SEED_PREFIX,
+            wallet_pda.as_ref(),
+            &nonce_bytes,
+            &idx,
+        ],
+        &machine_wallet::id(),
+    )
+}
+
+/// Search for a bump that makes `create_program_address` return Err (on-curve
+/// result). Used to deterministically exercise `InvalidEphemeralSignerBump`.
+fn find_on_curve_bump(wallet_pda: &Pubkey, nonce: u64, index: u8) -> Option<u8> {
+    let nonce_bytes = nonce.to_le_bytes();
+    let idx = [index];
+    for bump in (0..=255u8).rev() {
+        let bump_slice = [bump];
+        let seeds: [&[u8]; 5] = [
+            MachineWallet::EPHEMERAL_SIGNER_SEED_PREFIX,
+            wallet_pda.as_ref(),
+            &nonce_bytes,
+            &idx,
+            &bump_slice,
+        ];
+        if Pubkey::create_program_address(&seeds, &machine_wallet::id()).is_err() {
+            return Some(bump);
+        }
+    }
+    None
+}
+
+/// Happy path: a single ephemeral signer is used as the `to` account in
+/// `SystemProgram.createAccount`, with the vault PDA paying rent. Confirms
+/// `invoke_signed` actually grants signer privilege to the derived PDA when
+/// its pubkey appears in the inner-ix `FLAG_EPHEMERAL_SIGNER` slot.
+#[tokio::test]
+#[ignore = "requires secp256r1 precompile support in test validator"]
+async fn test_execute_v1_creates_account_via_ephemeral_signer() {
+    let (mut banks, payer, recent_blockhash) = program_test().start().await;
+    let (wallet_pda, vault_pda, signing_key, compressed) =
+        create_wallet_helper(&mut banks, &payer, recent_blockhash).await;
+
+    let recent_blockhash = banks.get_latest_blockhash().await.unwrap();
+    let fund_ix = system_instruction::transfer(&payer.pubkey(), &vault_pda, 2_000_000_000);
+    let fund_tx = Transaction::new_signed_with_payer(
+        &[fund_ix],
+        Some(&payer.pubkey()),
+        &[&payer],
+        recent_blockhash,
+    );
+    banks.process_transaction(fund_tx).await.unwrap();
+
+    let wallet_state = read_wallet_state(&mut banks, &wallet_pda).await;
+    let (ephemeral_pda, bump) = derive_ephemeral_signer(&wallet_pda, wallet_state.nonce, 0);
+
+    // SystemProgram.createAccount: vault funds 0 lamports of data, owned by system program.
+    // 890_880 is the rent-exempt minimum for a 0-byte system-owned account.
+    let create_ix = system_instruction::create_account(
+        &vault_pda,
+        &ephemeral_pda,
+        890_880,
+        0,
+        &system_program::id(),
+    );
+    let inner = make_inner(
+        system_program::id().to_bytes(),
+        &[
+            (0, AccountEntry::FLAG_WRITABLE),
+            (1, AccountEntry::FLAG_WRITABLE | AccountEntry::FLAG_EPHEMERAL_SIGNER),
+        ],
+        create_ix.data.clone(),
+    );
+
+    let inner_hash = hash_inner(
+        &[inner.clone()],
+        &[vault_pda, ephemeral_pda, system_program::id()],
+    );
+    let message = compute_message_hash_v1(
+        &wallet_pda,
+        wallet_state.creation_slot,
+        wallet_state.nonce,
+        u64::MAX,
+        &[bump],
+        &inner_hash,
+    );
+    let precompile_ix = build_secp256r1_ix(&signing_key, &compressed, &message);
+
+    let execute_ix = build_execute_v1_ix(
+        &payer.pubkey(),
+        &wallet_pda,
+        &vault_pda,
+        u64::MAX,
+        &[bump],
+        &[inner],
+        &[
+            AccountMeta::new(vault_pda, false),
+            AccountMeta::new(ephemeral_pda, false),
+            AccountMeta::new_readonly(system_program::id(), false),
+        ],
+    );
+
+    let recent_blockhash = banks.get_latest_blockhash().await.unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[precompile_ix, execute_ix],
+        Some(&payer.pubkey()),
+        &[&payer],
+        recent_blockhash,
+    );
+    banks.process_transaction(tx).await.unwrap();
+
+    // The ephemeral PDA must exist on-chain after the call.
+    let created = banks.get_account(ephemeral_pda).await.unwrap().unwrap();
+    assert_eq!(created.lamports, 890_880);
+    assert_eq!(created.owner, system_program::id());
+
+    let wallet = read_wallet_state(&mut banks, &wallet_pda).await;
+    assert_eq!(wallet.nonce, 1);
+}
+
+/// `FLAG_EPHEMERAL_SIGNER` on an account whose pubkey is *not* one of the
+/// per-Execute derived PDAs must be hard-rejected, even when the signature
+/// otherwise verifies. This is the core anti-forgery guarantee: a relay (or a
+/// buggy client) cannot promote an arbitrary account to signer just by
+/// flipping a flag bit.
+#[tokio::test]
+#[ignore = "requires secp256r1 precompile support in test validator"]
+async fn test_execute_v1_rejects_ephemeral_key_mismatch() {
+    let (mut banks, payer, recent_blockhash) = program_test().start().await;
+    let (wallet_pda, vault_pda, signing_key, compressed) =
+        create_wallet_helper(&mut banks, &payer, recent_blockhash).await;
+
+    let recent_blockhash = banks.get_latest_blockhash().await.unwrap();
+    let fund_ix = system_instruction::transfer(&payer.pubkey(), &vault_pda, 2_000_000_000);
+    banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[fund_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            recent_blockhash,
+        ))
+        .await
+        .unwrap();
+
+    let wallet_state = read_wallet_state(&mut banks, &wallet_pda).await;
+    // Declare 1 ephemeral signer (so disc=16 routing is taken) but put a
+    // *non-PDA* pubkey in the FLAG_EPHEMERAL_SIGNER slot. The bump value is
+    // legitimate (canonical), but the on-chain check compares the supplied
+    // pubkey against the derived list and fails.
+    let (_real_pda, bump) = derive_ephemeral_signer(&wallet_pda, wallet_state.nonce, 0);
+    let fake_pubkey = Pubkey::new_unique();
+
+    let recipient = Pubkey::new_unique();
+    let transfer_ix = system_instruction::transfer(&vault_pda, &recipient, 1_000);
+    let inner = make_inner(
+        system_program::id().to_bytes(),
+        &[
+            (0, AccountEntry::FLAG_WRITABLE),
+            // Slot 1 references `fake_pubkey` (not a derived ephemeral PDA),
+            // but is flagged as one — must be rejected at CPI dispatch.
+            (1, AccountEntry::FLAG_WRITABLE | AccountEntry::FLAG_EPHEMERAL_SIGNER),
+        ],
+        transfer_ix.data.clone(),
+    );
+
+    let inner_hash = hash_inner(
+        &[inner.clone()],
+        &[vault_pda, fake_pubkey, system_program::id()],
+    );
+    let message = compute_message_hash_v1(
+        &wallet_pda,
+        wallet_state.creation_slot,
+        wallet_state.nonce,
+        u64::MAX,
+        &[bump],
+        &inner_hash,
+    );
+    let precompile_ix = build_secp256r1_ix(&signing_key, &compressed, &message);
+
+    let execute_ix = build_execute_v1_ix(
+        &payer.pubkey(),
+        &wallet_pda,
+        &vault_pda,
+        u64::MAX,
+        &[bump],
+        &[inner],
+        &[
+            AccountMeta::new(vault_pda, false),
+            AccountMeta::new(fake_pubkey, false),
+            AccountMeta::new_readonly(system_program::id(), false),
+        ],
+    );
+
+    let recent_blockhash = banks.get_latest_blockhash().await.unwrap();
+    let err = banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[precompile_ix, execute_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            recent_blockhash,
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        contains_custom_err(
+            &err,
+            machine_wallet::error::MachineWalletError::EphemeralSignerKeyMismatch as u32
+        ),
+        "expected EphemeralSignerKeyMismatch, got {:?}",
+        err
+    );
+}
+
+/// An on-curve bump causes `Pubkey::create_program_address` to return Err,
+/// which the processor translates to `InvalidEphemeralSignerBump`. Catches
+/// the case where a malicious or buggy client signs a bump that doesn't
+/// produce a valid (off-curve) PDA.
+#[tokio::test]
+#[ignore = "requires secp256r1 precompile support in test validator"]
+async fn test_execute_v1_rejects_invalid_bump() {
+    let (mut banks, payer, recent_blockhash) = program_test().start().await;
+    let (wallet_pda, vault_pda, signing_key, compressed) =
+        create_wallet_helper(&mut banks, &payer, recent_blockhash).await;
+
+    let recent_blockhash = banks.get_latest_blockhash().await.unwrap();
+    let fund_ix = system_instruction::transfer(&payer.pubkey(), &vault_pda, 2_000_000_000);
+    banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[fund_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            recent_blockhash,
+        ))
+        .await
+        .unwrap();
+
+    let wallet_state = read_wallet_state(&mut banks, &wallet_pda).await;
+    // Sweep bump 255..=0 to find one whose seeds resolve on-curve. With ~50%
+    // hit rate per bump, this almost always finds one within the first few
+    // tries; if every bump is off-curve for this seed set (cryptographically
+    // unlikely), the test bails rather than asserting on a fabricated value.
+    let bad_bump = match find_on_curve_bump(&wallet_pda, wallet_state.nonce, 0) {
+        Some(b) => b,
+        None => return,
+    };
+
+    // The on-curve "PDA" pubkey is whatever we derive without the
+    // create_program_address rejection — pick any placeholder; the parser
+    // never sees it because we fail before CPI dispatch. We just need a
+    // remaining-accounts slot to satisfy the wire format.
+    let placeholder = Pubkey::new_unique();
+    let recipient = Pubkey::new_unique();
+    let transfer_ix = system_instruction::transfer(&vault_pda, &recipient, 1_000);
+    let inner = make_inner(
+        system_program::id().to_bytes(),
+        &[
+            (0, AccountEntry::FLAG_WRITABLE),
+            (1, AccountEntry::FLAG_WRITABLE | AccountEntry::FLAG_EPHEMERAL_SIGNER),
+        ],
+        transfer_ix.data.clone(),
+    );
+
+    let inner_hash = hash_inner(
+        &[inner.clone()],
+        &[vault_pda, placeholder, system_program::id()],
+    );
+    let message = compute_message_hash_v1(
+        &wallet_pda,
+        wallet_state.creation_slot,
+        wallet_state.nonce,
+        u64::MAX,
+        &[bad_bump],
+        &inner_hash,
+    );
+    let precompile_ix = build_secp256r1_ix(&signing_key, &compressed, &message);
+    let execute_ix = build_execute_v1_ix(
+        &payer.pubkey(),
+        &wallet_pda,
+        &vault_pda,
+        u64::MAX,
+        &[bad_bump],
+        &[inner],
+        &[
+            AccountMeta::new(vault_pda, false),
+            AccountMeta::new(placeholder, false),
+            AccountMeta::new_readonly(system_program::id(), false),
+        ],
+    );
+
+    let recent_blockhash = banks.get_latest_blockhash().await.unwrap();
+    let err = banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[precompile_ix, execute_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            recent_blockhash,
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        contains_custom_err(
+            &err,
+            machine_wallet::error::MachineWalletError::InvalidEphemeralSignerBump as u32
+        ),
+        "expected InvalidEphemeralSignerBump, got {:?}",
+        err
+    );
+}
+
+/// A disc=1 (v0) Execute that smuggles `FLAG_EPHEMERAL_SIGNER` into an inner
+/// account entry must be rejected. The v0 handler calls `execute_cpi_loop`
+/// with empty ephemeral lists, so the `contains` check returns false and the
+/// processor errors out — there is no v0 path that can grant the flag.
+#[tokio::test]
+#[ignore = "requires secp256r1 precompile support in test validator"]
+async fn test_execute_v0_rejects_ephemeral_signer_flag() {
+    let (mut banks, payer, recent_blockhash) = program_test().start().await;
+    let (wallet_pda, vault_pda, signing_key, compressed) =
+        create_wallet_helper(&mut banks, &payer, recent_blockhash).await;
+
+    let recent_blockhash = banks.get_latest_blockhash().await.unwrap();
+    let fund_ix = system_instruction::transfer(&payer.pubkey(), &vault_pda, 2_000_000_000);
+    banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[fund_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            recent_blockhash,
+        ))
+        .await
+        .unwrap();
+
+    let wallet_state = read_wallet_state(&mut banks, &wallet_pda).await;
+    let recipient = Pubkey::new_unique();
+    let transfer_ix = system_instruction::transfer(&vault_pda, &recipient, 1_000);
+    // Sign FLAG_EPHEMERAL_SIGNER on the recipient slot. The signature itself
+    // is valid (v0 message hash binds the flags via inner_hash), but the
+    // runtime must still refuse to grant signer privilege.
+    let inner = make_inner(
+        system_program::id().to_bytes(),
+        &[
+            (0, AccountEntry::FLAG_WRITABLE),
+            (1, AccountEntry::FLAG_WRITABLE | AccountEntry::FLAG_EPHEMERAL_SIGNER),
+        ],
+        transfer_ix.data.clone(),
+    );
+
+    let inner_hash = hash_inner(
+        &[inner.clone()],
+        &[vault_pda, recipient, system_program::id()],
+    );
+    let message = compute_message_hash(
+        &wallet_pda,
+        wallet_state.creation_slot,
+        wallet_state.nonce,
+        u64::MAX,
+        &inner_hash,
+    );
+    let precompile_ix = build_secp256r1_ix(&signing_key, &compressed, &message);
+    let execute_ix = build_execute_ix(
+        &payer.pubkey(),
+        &wallet_pda,
+        &vault_pda,
+        u64::MAX,
+        &[inner],
+        &[
+            AccountMeta::new(vault_pda, false),
+            AccountMeta::new(recipient, false),
+            AccountMeta::new_readonly(system_program::id(), false),
+        ],
+    );
+
+    let recent_blockhash = banks.get_latest_blockhash().await.unwrap();
+    let err = banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[precompile_ix, execute_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            recent_blockhash,
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        contains_custom_err(
+            &err,
+            machine_wallet::error::MachineWalletError::EphemeralSignerKeyMismatch as u32
+        ),
+        "expected EphemeralSignerKeyMismatch on disc=1 with FLAG_EPHEMERAL_SIGNER, got {:?}",
+        err
+    );
+}
+
+/// Bound check: the parser already rejects `num_ephemeral_signers > MAX_EPHEMERAL_SIGNERS`
+/// before any sig verify or PDA derivation. Uses an ED25519 wallet so this test
+/// runs without precompile support — the rejection happens at the parser layer.
+#[tokio::test]
+async fn test_execute_v1_rejects_over_cap_num_ephemeral() {
+    let (mut banks, payer, _recent_blockhash) = program_test().start().await;
+    let owner = Keypair::new();
+    let (wallet_pda, vault_pda) = create_ed25519_wallet_helper(&mut banks, &payer, &owner).await;
+
+    // Bypass build_execute_v1_ix's helpers so we can craft an over-cap
+    // num_ephemeral byte. The tx will reach the parser, which rejects.
+    let over_cap = (MAX_EPHEMERAL_SIGNERS + 1) as u8;
+    let mut data = vec![16u8];
+    data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_slot
+    data.push(over_cap);
+    data.extend_from_slice(&vec![1u8; over_cap as usize]); // bumps
+    data.extend_from_slice(&0u32.to_le_bytes()); // inner_count = 0 (irrelevant; rejected earlier)
+
+    let execute_ix = Instruction {
+        program_id: machine_wallet::id(),
+        accounts: vec![
+            AccountMeta::new_readonly(sysvar::instructions::id(), false),
+            AccountMeta::new(wallet_pda, false),
+            AccountMeta::new_readonly(payer.pubkey(), true),
+            AccountMeta::new(vault_pda, false),
+        ],
+        data,
+    };
+
+    let recent_blockhash = banks.get_latest_blockhash().await.unwrap();
+    let err = banks
+        .process_transaction(Transaction::new_signed_with_payer(
+            &[execute_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            recent_blockhash,
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        contains_custom_err(
+            &err,
+            machine_wallet::error::MachineWalletError::TooManyEphemeralSigners as u32
+        ),
+        "expected TooManyEphemeralSigners, got {:?}",
         err
     );
 }

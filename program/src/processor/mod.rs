@@ -88,6 +88,19 @@ pub fn process_instruction(
             max_slot,
             inner_instructions,
         } => execute::process(program_id, accounts, max_slot, inner_instructions),
+        MachineWalletInstruction::ExecuteWithEphemeralSigners {
+            max_slot,
+            num_ephemeral_signers,
+            ephemeral_signer_bumps,
+            inner_instructions,
+        } => execute::process_with_ephemeral_signers(
+            program_id,
+            accounts,
+            max_slot,
+            num_ephemeral_signers,
+            ephemeral_signer_bumps,
+            inner_instructions,
+        ),
         MachineWalletInstruction::CloseWallet {
             max_slot,
             destination,

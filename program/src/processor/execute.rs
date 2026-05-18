@@ -13,12 +13,16 @@ use solana_program::{
 use crate::{
     error::MachineWalletError,
     instruction::{InnerInstructionRef, MAX_INNER_INSTRUCTIONS},
-    state::{MachineWallet, SYSTEM_PROGRAM_ID},
+    state::{MachineWallet, MAX_EPHEMERAL_SIGNERS, SYSTEM_PROGRAM_ID},
     threshold,
 };
 
 /// Domain separator for Execute messages, prevents cross-protocol collision.
 const EXECUTE_TAG: &[u8] = b"machine_wallet_execute_v0";
+
+/// Distinct from `EXECUTE_TAG` so a v0-signed challenge cannot be replayed
+/// against the v1 handler; the bumps section is bound to this tag.
+const EXECUTE_TAG_V1: &[u8] = b"machine_wallet_execute_v1";
 
 /// Hash inner instructions: keccak256(ix0_hash || ix1_hash || ...)
 /// Each ix_hash = keccak256(program_id || accounts_len || (pubkey, flags)... || data_len || data)
@@ -124,15 +128,33 @@ pub(crate) fn validate_and_hash_inner_instructions(
     Ok((program_entries, inner_hash))
 }
 
-/// Execute CPI for each inner instruction via invoke_signed with vault PDA seeds.
-/// Shared by Execute (P-256 path) and SessionExecute (Ed25519 path).
+/// Execute CPI for each inner instruction via invoke_signed.
+///
+/// Shared by Execute (disc=1, P-256), ExecuteWithEphemeralSigners (disc=16),
+/// and SessionExecute (disc=5, Ed25519). The session path never carries
+/// ephemeral signers — sessions delegate vault authority only.
+///
+/// An inner-ix account whose pubkey == `vault_account.key` is signed by the
+/// vault PDA. An account flagged `FLAG_EPHEMERAL_SIGNER` whose pubkey is not
+/// in `ephemeral_signer_keys` is hard-rejected, never silently downgraded:
+/// the signed inner-ix hash binds the flag, so a key mismatch means either
+/// a client bug or a relay forging signer privilege onto an arbitrary key.
 pub(crate) fn execute_cpi_loop(
     inner_instructions: &[InnerInstructionRef<'_>],
     program_entries: Vec<(usize, Pubkey)>,
     remaining_accounts: &[AccountInfo],
     vault_account: &AccountInfo,
     vault_signer_seeds: &[&[u8]],
+    ephemeral_signer_seeds: &[&[&[u8]]],
+    ephemeral_signer_keys: &[Pubkey],
 ) -> ProgramResult {
+    let mut all_signer_seeds: Vec<&[&[u8]]> =
+        Vec::with_capacity(ephemeral_signer_seeds.len() + 1);
+    all_signer_seeds.push(vault_signer_seeds);
+    for s in ephemeral_signer_seeds {
+        all_signer_seeds.push(s);
+    }
+
     // Pre-size to the worst-case inner instruction so the first iteration
     // doesn't trigger a heap reallocation. `+1` on account_infos accounts
     // for the program account pushed at the end of each iteration.
@@ -162,7 +184,16 @@ pub(crate) fn execute_cpi_loop(
                 .get(entry.index as usize)
                 .ok_or(ProgramError::NotEnoughAccountKeys)?;
 
-            let is_signer = acc.key == vault_account.key;
+            let is_signer = if acc.key == vault_account.key {
+                true
+            } else if entry.is_ephemeral_signer() {
+                if !ephemeral_signer_keys.contains(acc.key) {
+                    return Err(MachineWalletError::EphemeralSignerKeyMismatch.into());
+                }
+                true
+            } else {
+                false
+            };
 
             if entry.is_writable() {
                 account_metas.push(AccountMeta::new(*acc.key, is_signer));
@@ -182,18 +213,55 @@ pub(crate) fn execute_cpi_loop(
             data: core::mem::take(&mut cpi_data),
         };
 
-        invoke_signed(&cpi_instruction, &account_infos, &[vault_signer_seeds])?;
+        invoke_signed(&cpi_instruction, &account_infos, &all_signer_seeds)?;
         account_metas = cpi_instruction.accounts;
         cpi_data = cpi_instruction.data;
     }
     Ok(())
 }
 
-/// Compute message: keccak256(EXECUTE_TAG || wallet_address || creation_slot_le || nonce_le || max_slot_le || inner_instructions_hash)
-/// Domain tag differentiates Execute from CloseWallet messages.
-/// creation_slot binds the signature to a specific wallet lifetime, preventing replay after close+recreate.
-/// max_slot enforces signature expiry — the transaction must land before this slot.
-/// Zero heap allocation — uses hashv with stack-local byte arrays.
+/// keccak256(tag || wallet || creation_slot_le || nonce_le || max_slot_le || extra... || inner_hash)
+///
+/// `extra` slots in between max_slot and inner_hash so v1 can carry a
+/// length-prefixed `ephemeral_signer_bumps` block without disturbing the v0
+/// field order. v0 uses 0 extras, v1 uses 2 (bumps_len + bumps_used); buffer
+/// is sized to MAX_EXTRA so a future caller that exceeds it panics in any
+/// build (not just debug) rather than silently producing the wrong hash.
+fn build_message_hash(
+    tag: &[u8],
+    wallet_address: &Pubkey,
+    creation_slot: u64,
+    nonce: u64,
+    max_slot: u64,
+    extra: &[&[u8]],
+    inner_hash: &[u8; 32],
+) -> [u8; 32] {
+    const PREFIX_LEN: usize = 5;
+    const MAX_EXTRA: usize = 4;
+    const PARTS_LEN: usize = PREFIX_LEN + MAX_EXTRA + 1;
+    assert!(
+        extra.len() <= MAX_EXTRA,
+        "build_message_hash: extra section exceeds {} slots",
+        MAX_EXTRA,
+    );
+
+    let creation_slot_bytes = creation_slot.to_le_bytes();
+    let nonce_bytes = nonce.to_le_bytes();
+    let max_slot_bytes = max_slot.to_le_bytes();
+    let mut parts: [&[u8]; PARTS_LEN] = [&[]; PARTS_LEN];
+    parts[0] = tag;
+    parts[1] = wallet_address.as_ref();
+    parts[2] = &creation_slot_bytes;
+    parts[3] = &nonce_bytes;
+    parts[4] = &max_slot_bytes;
+    parts[PREFIX_LEN..PREFIX_LEN + extra.len()].copy_from_slice(extra);
+    parts[PREFIX_LEN + extra.len()] = inner_hash;
+    keccak::hashv(&parts[..PREFIX_LEN + extra.len() + 1]).to_bytes()
+}
+
+/// Domain tag separates Execute from CloseWallet / v1; creation_slot binds the
+/// signature to a wallet lifetime so close+recreate can't replay; max_slot is
+/// signature expiry.
 pub fn compute_message_hash(
     wallet_address: &Pubkey,
     creation_slot: u64,
@@ -201,18 +269,15 @@ pub fn compute_message_hash(
     max_slot: u64,
     inner_hash: &[u8; 32],
 ) -> [u8; 32] {
-    let creation_slot_bytes = creation_slot.to_le_bytes();
-    let nonce_bytes = nonce.to_le_bytes();
-    let max_slot_bytes = max_slot.to_le_bytes();
-    keccak::hashv(&[
+    build_message_hash(
         EXECUTE_TAG,
-        wallet_address.as_ref(),
-        &creation_slot_bytes,
-        &nonce_bytes,
-        &max_slot_bytes,
+        wallet_address,
+        creation_slot,
+        nonce,
+        max_slot,
+        &[],
         inner_hash,
-    ])
-    .to_bytes()
+    )
 }
 
 /// Execute preamble. Validates accounts, enforces anti-reentry, verifies PDAs,
@@ -370,6 +435,127 @@ pub fn process(
         remaining_accounts,
         vault_account,
         vault_signer_seeds,
+        &[],
+        &[],
+    )?;
+
+    Ok(())
+}
+
+/// Disc=16 entry point: derives N ephemeral signer PDAs from
+/// `(wallet, wallet.nonce, slot_index, bump)`, binds them into the v1
+/// challenge hash, then funnels into `execute_cpi_loop` with the seeds wired
+/// through to `invoke_signed`.
+///
+/// Squads v4 parity: same per-Execute ephemeral-signer model. Squads seeds on
+/// the per-tx transaction PDA; we have no per-tx state account, so we seed on
+/// the wallet's monotonic nonce instead — both produce unique-per-Execute
+/// PDAs that can't replay.
+pub fn process_with_ephemeral_signers(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    max_slot: u64,
+    num_ephemeral_signers: u8,
+    ephemeral_signer_bumps: [u8; MAX_EPHEMERAL_SIGNERS],
+    inner_instructions: Vec<InnerInstructionRef<'_>>,
+) -> ProgramResult {
+    let n = num_ephemeral_signers as usize;
+    // `pub` entry point — defence-in-depth in case a future caller bypasses
+    // the parser, which already rejects n == 0 || n > MAX_EPHEMERAL_SIGNERS.
+    if n == 0 || n > MAX_EPHEMERAL_SIGNERS {
+        return Err(MachineWalletError::TooManyEphemeralSigners.into());
+    }
+
+    let account_iter = &mut accounts.iter();
+    let instructions_sysvar = next_account_info(account_iter)?;
+    let wallet_account = next_account_info(account_iter)?;
+    let fee_payer = next_account_info(account_iter)?;
+    let vault_account = next_account_info(account_iter)?;
+    let remaining_accounts = &accounts[4..];
+
+    let (wallet, program_entries, inner_hash) = prepare_execute_context(
+        program_id,
+        instructions_sysvar,
+        wallet_account,
+        fee_payer,
+        vault_account,
+        remaining_accounts,
+        max_slot,
+        &inner_instructions,
+    )?;
+
+    // Seeds bind to current nonce: nonce bumps on success, so a re-broadcast
+    // derives different PDAs that no longer match the signed inner-ix flags.
+    let nonce_bytes = wallet.nonce.to_le_bytes();
+    let bumps_used = &ephemeral_signer_bumps[..n];
+
+    let mut idx_buf: [[u8; 1]; MAX_EPHEMERAL_SIGNERS] = [[0; 1]; MAX_EPHEMERAL_SIGNERS];
+    let mut bump_buf: [[u8; 1]; MAX_EPHEMERAL_SIGNERS] = [[0; 1]; MAX_EPHEMERAL_SIGNERS];
+    for i in 0..n {
+        idx_buf[i][0] = i as u8;
+        bump_buf[i][0] = bumps_used[i];
+    }
+
+    const EMPTY: &[u8] = &[];
+    let mut seed_arrays: [[&[u8]; 5]; MAX_EPHEMERAL_SIGNERS] =
+        [[EMPTY; 5]; MAX_EPHEMERAL_SIGNERS];
+    let mut ephemeral_keys: [Pubkey; MAX_EPHEMERAL_SIGNERS] =
+        [Pubkey::default(); MAX_EPHEMERAL_SIGNERS];
+    for i in 0..n {
+        seed_arrays[i] = [
+            MachineWallet::EPHEMERAL_SIGNER_SEED_PREFIX,
+            wallet_account.key.as_ref(),
+            &nonce_bytes,
+            &idx_buf[i],
+            &bump_buf[i],
+        ];
+        ephemeral_keys[i] = Pubkey::create_program_address(&seed_arrays[i], program_id)
+            .map_err(|_| MachineWalletError::InvalidEphemeralSignerBump)?;
+    }
+
+    let bumps_len = [n as u8];
+    let expected_message = build_message_hash(
+        EXECUTE_TAG_V1,
+        wallet_account.key,
+        wallet.creation_slot,
+        wallet.nonce,
+        max_slot,
+        &[&bumps_len, bumps_used],
+        &inner_hash,
+    );
+
+    threshold::verify_wallet_signatures(
+        instructions_sysvar,
+        program_id,
+        &wallet,
+        &expected_message,
+    )?;
+
+    // CEI: bump nonce before any CPI.
+    {
+        let mut data = wallet_account.try_borrow_mut_data()?;
+        wallet.write_incremented_nonce(&mut data)?;
+    }
+
+    let vault_signer_seeds: &[&[u8]] = &[
+        MachineWallet::VAULT_SEED_PREFIX,
+        wallet_account.key.as_ref(),
+        &[wallet.vault_bump],
+    ];
+
+    let mut seed_slices: [&[&[u8]]; MAX_EPHEMERAL_SIGNERS] = [&[]; MAX_EPHEMERAL_SIGNERS];
+    for i in 0..n {
+        seed_slices[i] = &seed_arrays[i];
+    }
+
+    execute_cpi_loop(
+        &inner_instructions,
+        program_entries,
+        remaining_accounts,
+        vault_account,
+        vault_signer_seeds,
+        &seed_slices[..n],
+        &ephemeral_keys[..n],
     )?;
 
     Ok(())

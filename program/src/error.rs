@@ -53,6 +53,15 @@ pub enum MachineWalletError {
     WebAuthnRpIdMismatch = 47,
     SessionSpendCapExceeded = 48,
     TooManyWebAuthnEvidence = 50,
+    /// Execute payload declared more ephemeral signers than MAX_EPHEMERAL_SIGNERS.
+    TooManyEphemeralSigners = 51,
+    /// Caller-supplied bump for an ephemeral signer slot does not produce a
+    /// valid PDA under the program — derivation rejected by the runtime.
+    InvalidEphemeralSignerBump = 52,
+    /// An inner-instruction account declared FLAG_EPHEMERAL_SIGNER but its
+    /// pubkey is not one of the PDAs derived for this Execute call. Stops a
+    /// relay from forging signer privilege onto an arbitrary account.
+    EphemeralSignerKeyMismatch = 53,
 }
 
 impl From<MachineWalletError> for ProgramError {
@@ -128,6 +137,14 @@ impl std::fmt::Display for MachineWalletError {
             Self::TooManyWebAuthnEvidence => {
                 write!(f, "Too many ProvideWebAuthnEvidence sidecar instructions")
             }
+            Self::TooManyEphemeralSigners => write!(f, "Too many ephemeral signers"),
+            Self::InvalidEphemeralSignerBump => {
+                write!(f, "Ephemeral signer bump does not produce a valid PDA")
+            }
+            Self::EphemeralSignerKeyMismatch => write!(
+                f,
+                "Inner-ix account flagged FLAG_EPHEMERAL_SIGNER but pubkey is not a derived ephemeral PDA"
+            ),
         }
     }
 }
@@ -194,5 +211,8 @@ mod tests {
         assert_eq!(MachineWalletError::WebAuthnRpIdMismatch as u32, 47);
         assert_eq!(MachineWalletError::SessionSpendCapExceeded as u32, 48);
         assert_eq!(MachineWalletError::TooManyWebAuthnEvidence as u32, 50);
+        assert_eq!(MachineWalletError::TooManyEphemeralSigners as u32, 51);
+        assert_eq!(MachineWalletError::InvalidEphemeralSignerBump as u32, 52);
+        assert_eq!(MachineWalletError::EphemeralSignerKeyMismatch as u32, 53);
     }
 }

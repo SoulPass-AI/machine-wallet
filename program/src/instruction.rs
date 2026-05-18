@@ -1,7 +1,7 @@
 use solana_program::program_error::ProgramError;
 
 use crate::error::MachineWalletError;
-use crate::state::MAX_ALLOWED_PROGRAMS;
+use crate::state::{MAX_ALLOWED_PROGRAMS, MAX_EPHEMERAL_SIGNERS};
 use crate::webauthn::MAX_CLIENT_DATA_JSON_SIZE;
 
 /// Maximum number of inner instructions in a single Execute call.
@@ -9,19 +9,33 @@ use crate::webauthn::MAX_CLIENT_DATA_JSON_SIZE;
 pub const MAX_INNER_INSTRUCTIONS: usize = 64;
 
 /// A single account entry for CPI: index into remaining_accounts + permission flags.
-/// The authority signs these flags, preventing relay manipulation of is_writable.
+/// The authority signs these flags (they participate in the inner-ix hash that
+/// feeds the threshold signature), preventing relay manipulation of is_writable
+/// or is_signer between sign-time and execute-time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AccountEntry {
     pub index: u8,
     /// Bit 0: is_writable
+    /// Bit 1: is_ephemeral_signer — account is one of the per-Execute ephemeral
+    ///        signer PDAs. Signer privilege is provided by `invoke_signed` using
+    ///        seeds derived from `wallet.nonce`, not by an outer-tx signature.
     pub flags: u8,
 }
 
 impl AccountEntry {
     pub const FLAG_WRITABLE: u8 = 0x01;
+    pub const FLAG_EPHEMERAL_SIGNER: u8 = 0x02;
+    /// Mask of all currently-defined flag bits — reserved bits MUST be zero so
+    /// future flag additions can extend the schema without breaking the
+    /// "signed flags are stable" invariant.
+    pub const FLAGS_VALID_MASK: u8 = Self::FLAG_WRITABLE | Self::FLAG_EPHEMERAL_SIGNER;
 
     pub fn is_writable(&self) -> bool {
         self.flags & Self::FLAG_WRITABLE != 0
+    }
+
+    pub fn is_ephemeral_signer(&self) -> bool {
+        self.flags & Self::FLAG_EPHEMERAL_SIGNER != 0
     }
 }
 
@@ -110,6 +124,9 @@ impl InnerInstructionRef<'_> {
 ///   clientDataJSON available to every wallet instruction in the same tx for
 ///   WEBAUTHN-scheme threshold contribution. auth_data is read directly from
 ///   the paired secp256r1 precompile message by the threshold scanner.
+/// - ExecuteWithEphemeralSigners: [16] + max_slot (u64 LE)
+///                                + num_ephemeral (u8) + ephemeral_signer_bumps (num_ephemeral bytes)
+///                                + inner_instruction_count (u32 LE) + inner instructions
 ///
 /// Inner instruction wire format:
 ///   program_id (32) + accounts_len (u16 LE) + data_len (u16 LE) + accounts (accounts_len * 2 bytes: index + flags) + data
@@ -211,6 +228,28 @@ pub enum MachineWalletInstruction<'a> {
     /// The JSON is re-hashed on-chain and compared to the precompile tail, so
     /// the parsed challenge is bound to the exact bytes signed by WebAuthn.
     ProvideWebAuthnEvidence { client_data_json: &'a [u8] },
+
+    /// Execute (disc=16) — same as `Execute` but with N per-call ephemeral
+    /// signer PDAs whose signer privilege is supplied by `invoke_signed` (no
+    /// outer-tx signature needed). Models Squads v4's ephemeral signers:
+    /// a dApp tells the wallet "I need K ephemeral signers", the wallet
+    /// derives K PDAs scoped to `(wallet, current_nonce, slot_index)`, and
+    /// inner instructions referencing those PDAs in slots flagged
+    /// `FLAG_EPHEMERAL_SIGNER` get the signer flag at CPI time.
+    ///
+    /// Unblocks integrations with programs that require external keypair
+    /// signers on inner instructions (Switchboard `Randomness.create`,
+    /// `SystemProgram.createAccount`, token-metadata `MasterEdition`, …)
+    /// — none of which would otherwise be reachable from a passkey wallet.
+    ExecuteWithEphemeralSigners {
+        max_slot: u64,
+        /// Number of valid entries in `ephemeral_signer_bumps`. `1..=MAX_EPHEMERAL_SIGNERS`.
+        num_ephemeral_signers: u8,
+        /// Caller-supplied bumps for `Pubkey::create_program_address`. Fixed-size
+        /// array (not Vec) to keep the parser on `&[u8]` view with no heap.
+        ephemeral_signer_bumps: [u8; MAX_EPHEMERAL_SIGNERS],
+        inner_instructions: Vec<InnerInstructionRef<'a>>,
+    },
 }
 
 /// Parse inner instructions from a byte slice starting at the count field.
@@ -255,7 +294,7 @@ fn parse_inner_instructions(data: &[u8]) -> Result<Vec<InnerInstructionRef<'_>>,
         }
         let account_bytes = &data[offset..accounts_end];
         for chunk in account_bytes.chunks_exact(2) {
-            if chunk[1] & !AccountEntry::FLAG_WRITABLE != 0 {
+            if chunk[1] & !AccountEntry::FLAGS_VALID_MASK != 0 {
                 return Err(ProgramError::InvalidInstructionData);
             }
         }
@@ -500,6 +539,35 @@ impl<'a> MachineWalletInstruction<'a> {
             15 => {
                 let client_data_json = parse_webauthn_evidence_payload(rest)?;
                 Ok(Self::ProvideWebAuthnEvidence { client_data_json })
+            }
+
+            // num_ephemeral=0 is rejected so the disc=1/disc=16 split stays
+            // semantic ("v1 always carries at least one signer") instead of
+            // letting disc=16 silently behave like disc=1.
+            16 => {
+                if rest.len() < 8 + 1 {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                let max_slot = u64::from_le_bytes(rest[0..8].try_into().unwrap());
+                let num_ephemeral = rest[8] as usize;
+                if num_ephemeral == 0 || num_ephemeral > MAX_EPHEMERAL_SIGNERS {
+                    return Err(MachineWalletError::TooManyEphemeralSigners.into());
+                }
+                let bumps_end = 9usize
+                    .checked_add(num_ephemeral)
+                    .ok_or(ProgramError::InvalidInstructionData)?;
+                if bumps_end > rest.len() {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                let mut ephemeral_signer_bumps = [0u8; MAX_EPHEMERAL_SIGNERS];
+                ephemeral_signer_bumps[..num_ephemeral].copy_from_slice(&rest[9..bumps_end]);
+                let inner_instructions = parse_inner_instructions(&rest[bumps_end..])?;
+                Ok(Self::ExecuteWithEphemeralSigners {
+                    max_slot,
+                    num_ephemeral_signers: num_ephemeral as u8,
+                    ephemeral_signer_bumps,
+                    inner_instructions,
+                })
             }
 
             _ => Err(ProgramError::InvalidInstructionData),
@@ -827,9 +895,29 @@ mod tests {
         data.extend_from_slice(&[0xAAu8; 32]); // program_id
         data.extend_from_slice(&1u16.to_le_bytes()); // accounts_len = 1
         data.extend_from_slice(&0u16.to_le_bytes()); // data_len = 0
-        data.extend_from_slice(&[0, 0x02]); // index=0, flags=0x02 (unknown bit)
+        // Pick the lowest reserved bit (above FLAGS_VALID_MASK) so this test
+        // remains a "any future flag added breaks me" canary — the failing
+        // assertion forces an explicit decision about the new bit's semantics.
+        let reserved_bit = !AccountEntry::FLAGS_VALID_MASK & 0x04;
+        data.extend_from_slice(&[0, reserved_bit]);
         let result = MachineWalletInstruction::unpack(&data);
         assert_eq!(result.unwrap_err(), ProgramError::InvalidInstructionData);
+    }
+
+    #[test]
+    fn test_ephemeral_signer_flag_accepted() {
+        // FLAG_EPHEMERAL_SIGNER alone is a legal AccountEntry.flags value —
+        // the corresponding processor enforces "pubkey must match a derived
+        // PDA", not the parser. Parser only refuses *unknown* bits.
+        let mut data = vec![1u8];
+        data.extend_from_slice(&100u64.to_le_bytes());
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&[0xAAu8; 32]);
+        data.extend_from_slice(&1u16.to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes());
+        data.extend_from_slice(&[0, AccountEntry::FLAG_EPHEMERAL_SIGNER]);
+        let result = MachineWalletInstruction::unpack(&data);
+        assert!(result.is_ok());
     }
 
     #[test]
@@ -1319,5 +1407,80 @@ mod tests {
             ix,
             MachineWalletInstruction::ProvideWebAuthnEvidence { .. }
         ));
+    }
+
+    // ─── ExecuteWithEphemeralSigners (disc=16) parser ──────────────────────
+
+    fn build_exec_v1(num_eph: u8, bumps: &[u8]) -> Vec<u8> {
+        let mut data = vec![16u8];
+        data.extend_from_slice(&500u64.to_le_bytes()); // max_slot
+        data.push(num_eph);
+        data.extend_from_slice(bumps);
+        data.extend_from_slice(&1u32.to_le_bytes()); // inner_count = 1
+        data.extend_from_slice(&[0xCCu8; 32]); // program_id
+        data.extend_from_slice(&0u16.to_le_bytes()); // accounts_len = 0
+        data.extend_from_slice(&0u16.to_le_bytes()); // data_len = 0
+        data
+    }
+
+    #[test]
+    fn test_parse_execute_v1_happy() {
+        let data = build_exec_v1(2, &[255, 254]);
+        let ix = MachineWalletInstruction::unpack(&data).unwrap();
+        match ix {
+            MachineWalletInstruction::ExecuteWithEphemeralSigners {
+                max_slot,
+                num_ephemeral_signers,
+                ephemeral_signer_bumps,
+                inner_instructions,
+            } => {
+                assert_eq!(max_slot, 500);
+                assert_eq!(num_ephemeral_signers, 2);
+                assert_eq!(&ephemeral_signer_bumps[..2], &[255, 254]);
+                // Tail of the array stays zero — only first `num` are meaningful.
+                assert!(ephemeral_signer_bumps[2..].iter().all(|b| *b == 0));
+                assert_eq!(inner_instructions.len(), 1);
+            }
+            _ => panic!("expected ExecuteWithEphemeralSigners"),
+        }
+    }
+
+    #[test]
+    fn test_parse_execute_v1_zero_signers_rejected() {
+        // disc=16 with num_ephemeral=0 is illegal — callers must use disc=1
+        // instead. Catching this in the parser keeps the disc=1/disc=16 split
+        // semantic ("v1 always carries at least one signer") instead of letting
+        // disc=16 silently behave like disc=1.
+        let data = build_exec_v1(0, &[]);
+        let err = MachineWalletInstruction::unpack(&data).unwrap_err();
+        assert_eq!(
+            err,
+            MachineWalletError::TooManyEphemeralSigners.into(),
+        );
+    }
+
+    #[test]
+    fn test_parse_execute_v1_over_cap_rejected() {
+        let bumps = vec![1u8; MAX_EPHEMERAL_SIGNERS + 1];
+        let data = build_exec_v1((MAX_EPHEMERAL_SIGNERS + 1) as u8, &bumps);
+        let err = MachineWalletInstruction::unpack(&data).unwrap_err();
+        assert_eq!(
+            err,
+            MachineWalletError::TooManyEphemeralSigners.into(),
+        );
+    }
+
+    #[test]
+    fn test_parse_execute_v1_truncated_bumps() {
+        // Declare 3 ephemeral signers but only supply 2 bumps → must reject
+        // before reaching parse_inner_instructions (which would otherwise read
+        // partial bump bytes as inner_count and produce confusing errors).
+        let mut data = vec![16u8];
+        data.extend_from_slice(&500u64.to_le_bytes());
+        data.push(3);
+        data.extend_from_slice(&[1, 2]); // only 2 bumps
+        // No inner_count follows — payload too short.
+        let err = MachineWalletInstruction::unpack(&data).unwrap_err();
+        assert_eq!(err, ProgramError::InvalidInstructionData);
     }
 }

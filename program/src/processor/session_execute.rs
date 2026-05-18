@@ -219,6 +219,10 @@ pub fn process(
         remaining_accounts,
         vault_account,
         vault_signer_seeds,
+        // Session path never carries ephemeral signers — sessions delegate the
+        // vault authority only, not arbitrary keypair-signer slots.
+        &[],
+        &[],
     )?;
 
     // 19. SOL outflow cap check (atomic rollback if exceeded).

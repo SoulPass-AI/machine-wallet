@@ -130,6 +130,21 @@ impl MachineWallet {
     /// Vault PDA seed prefix.
     pub const VAULT_SEED_PREFIX: &'static [u8] = b"machine_vault";
 
+    /// Per-Execute ephemeral signer PDA seed prefix.
+    ///
+    /// Seeds: `[EPHEMERAL_SIGNER_SEED_PREFIX, wallet_account_key, wallet.nonce.le_bytes(), index_u8, bump]`.
+    ///
+    /// Wallet nonce is monotonic and bumps on every Execute, so each Execute call
+    /// produces a fresh set of PDAs; a relay can't replay a prior tx's ephemeral
+    /// signer slot because the seeds (and thus the derived PDA) change. The
+    /// PDA's only role is to provide `invoke_signed` signer privilege to one
+    /// inner instruction — it never holds long-lived state.
+    ///
+    /// Squads v4 uses the same pattern but seeded on the multisig transaction
+    /// PDA; machine-wallet has no per-tx state account, so we use the wallet's
+    /// own monotonic nonce instead.
+    pub const EPHEMERAL_SIGNER_SEED_PREFIX: &'static [u8] = b"machine_ephemeral";
+
     /// Increment the nonce in a serialized wallet buffer. Single point of
     /// change for nonce-bump semantics across every state-mutating processor.
     pub fn write_incremented_nonce(&self, data: &mut [u8]) -> Result<(), ProgramError> {
@@ -346,6 +361,15 @@ impl MachineWallet {
 
 /// Maximum number of allowed programs in a session whitelist.
 pub const MAX_ALLOWED_PROGRAMS: usize = 8;
+
+/// Maximum number of ephemeral signer PDAs an Execute call may request.
+///
+/// Each adds 32 bytes to outer-tx account_keys (or 1 byte if covered by an
+/// ALT lookup) plus one entry in the `invoke_signed` signer-seeds array.
+/// 4 covers every known use case (Switchboard Randomness.create needs 1,
+/// SystemProgram.createAccount needs 1, token-metadata Master Edition needs
+/// up to 2) with room to spare.
+pub const MAX_EPHEMERAL_SIGNERS: usize = 4;
 
 /// Session PDA seed prefix.
 pub const SESSION_SEED_PREFIX: &[u8] = b"machine_session";
